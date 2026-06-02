@@ -345,7 +345,15 @@ def probe(
     from agentsentinel_cli.probe import run_probe
     from agentsentinel_cli.probe_report import print_probe_result, as_probe_json
 
-    categories = [c.strip() for c in attack_cats.split(",")] if attack_cats else None
+    _VALID_CATEGORIES = {"injection", "jailbreak", "extraction", "encoding", "context", "scope"}
+    categories: list[str] | None = None
+    if attack_cats:
+        requested = [c.strip() for c in attack_cats.split(",") if c.strip()]
+        invalid = [c for c in requested if c not in _VALID_CATEGORIES]
+        if invalid:
+            console.print(f"[yellow]Warning: unknown attack categories ignored: {', '.join(invalid)}[/yellow]")
+            console.print(f"  Valid categories: {', '.join(sorted(_VALID_CATEGORIES))}")
+        categories = [c for c in requested if c in _VALID_CATEGORIES] or None
 
     config = TargetConfig(
         url=target_url,
@@ -933,8 +941,12 @@ def supply_chain(
 
     # ── Save baseline if requested ────────────────────────────────────────────
     if save_baseline_path:
+        save_p = _Path(save_baseline_path)
+        if save_p.suffix.lower() != ".json":
+            console.print("[red]Error:[/red] --save-baseline path must end in .json")
+            sys.exit(1)
         baseline_data = make_baseline(server, display_target)
-        _Path(save_baseline_path).write_text(_json.dumps(baseline_data, indent=2))
+        save_p.write_text(_json.dumps(baseline_data, indent=2))
         if fmt == "text":
             console.print(
                 f"\n  [green]✓ Baseline saved:[/green] {save_baseline_path}  "
@@ -944,10 +956,17 @@ def supply_chain(
     # ── Load baseline if provided ─────────────────────────────────────────────
     baseline: dict | None = None
     if baseline_path:
+        load_p = _Path(baseline_path)
+        if load_p.suffix.lower() != ".json":
+            console.print("[red]Error:[/red] --baseline path must be a .json file")
+            sys.exit(1)
         try:
-            baseline = _json.loads(_Path(baseline_path).read_text())
-        except Exception as exc:
-            console.print(f"[red]Error reading baseline:[/red] {exc}")
+            baseline = _json.loads(load_p.read_text())
+        except FileNotFoundError:
+            console.print(f"[red]Error:[/red] Baseline file not found: {baseline_path}")
+            sys.exit(1)
+        except _json.JSONDecodeError:
+            console.print(f"[red]Error:[/red] Baseline file is not valid JSON: {baseline_path}")
             sys.exit(1)
 
     # ── Run static rules ──────────────────────────────────────────────────────
@@ -1008,17 +1027,24 @@ def _parse_ports(ports_str: str) -> list[int]:
     ports: list[int] = []
     for part in ports_str.split(","):
         part = part.strip()
-        if "-" in part:
-            lo, _, hi = part.partition("-")
-            try:
-                ports.extend(range(int(lo), int(hi) + 1))
-            except ValueError:
-                pass
-        else:
-            try:
-                ports.append(int(part))
-            except ValueError:
-                pass
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                lo, _, hi = part.partition("-")
+                lo_i, hi_i = int(lo), int(hi)
+                if not (1 <= lo_i <= 65535 and 1 <= hi_i <= 65535 and lo_i <= hi_i):
+                    raise ValueError
+                ports.extend(range(lo_i, hi_i + 1))
+            else:
+                p = int(part)
+                if not (1 <= p <= 65535):
+                    raise ValueError
+                ports.append(p)
+        except ValueError:
+            console.print(f"[yellow]Warning: invalid port specification '{part}' — skipped[/yellow]")
+    if not ports:
+        raise click.ClickException(f"No valid ports found in: {ports_str}")
     return ports
 
 

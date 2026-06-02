@@ -367,7 +367,7 @@ def _probe_port(host: str, port: int, timeout: float) -> DiscoveredAgent | None:
     base = f"http://{host}:{port}"
     location = f"{host}:{port}"
 
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
 
         # MCP SSE server
         for path in _MCP_INDICATOR_PATHS:
@@ -625,6 +625,10 @@ def _docker_available() -> bool:
 
 
 def _docker_inspect_env(container_id: str) -> dict[str, str]:
+    import re
+    # Container IDs are 64-char hex (full) or 12-char hex (short) — nothing else
+    if not re.fullmatch(r"[a-f0-9]{12}([a-f0-9]{52})?", container_id):
+        return {}
     try:
         result = subprocess.run(
             ["docker", "inspect", "--format",
