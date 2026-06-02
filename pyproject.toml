@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentsentinel-cli"
-version = "0.6.0"
+version = "0.6.1"
 description = "Agentic security CLI — AI analyst with memory, supply chain audit, MCP audit, red-team probing, and agent discovery"
 readme = "README.md"
 requires-python = ">=3.10"
