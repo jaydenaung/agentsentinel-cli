@@ -9,10 +9,11 @@ description = "Agentic security CLI — AI analyst with memory, supply chain aud
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
-keywords = ["ai-security", "llm", "agent-security", "langchain", "mcp", "openai", "cli", "scanner", "devsecops", "discovery"]
+keywords = ["ai-security", "agent-security", "agentic-security", "mcp", "mcp-security", "owasp", "llm-security", "supply-chain-security", "cli", "scanner", "devsecops", "red-team"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Security",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -74,8 +75,9 @@ all = [
 sentinel = "agentsentinel_cli.cli:main"
 
 [project.urls]
-Homepage   = "https://github.com/jaydenaung/agentsentinel"
-Repository = "https://github.com/jaydenaung/agentsentinel"
+Homepage   = "https://github.com/jaydenaung/agentsentinel-cli"
+Repository = "https://github.com/jaydenaung/agentsentinel-cli"
+"Bug Tracker" = "https://github.com/jaydenaung/agentsentinel-cli/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentsentinel_cli"]

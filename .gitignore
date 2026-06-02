@@ -1,22 +1,41 @@
-.venv/
+# Python
 __pycache__/
 *.pyc
 *.pyo
-.env
-.coverage
-htmlcov/
-.pytest_cache/
+*.pyd
 *.egg-info/
+*.egg
+.eggs/
+
+# Build & dist
 dist/
 build/
-ui/.env
-ui/node_modules/
-ui/dist/
-nginx/certs/*.crt
-nginx/certs/*.key
-nginx/certs/*.pem
-prompt/
-tmp/
-memory/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing & coverage
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Environment & secrets
+.env
+.env.*
+
+# Sentinel analyst memory (local state, not for commit)
+.sentinel/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
 ~$*
