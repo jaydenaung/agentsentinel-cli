@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/agentsentinel-cli)](https://pypi.org/project/agentsentinel-cli/)
 
-**AI agent security — analyst mode, static rules, red-team probing, and MCP auditing. No server. No Docker. One install.**
+**AI agent security — analyst mode, multi-agent trust analysis, static rules, red-team probing, and MCP auditing. No server. No Docker. One install.**
 
 ```bash
 pipx install "agentsentinel-cli[all]"
@@ -14,7 +14,7 @@ pipx install "agentsentinel-cli[all]"
 
 ## What it does
 
-`sentinel` covers 8 of the 10 risks in the [OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/).
+`sentinel` covers 9 of the 10 risks in the [OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/).
 
 It operates at two levels:
 
@@ -35,6 +35,10 @@ sentinel agentic ./my-agent/
 # Supply chain audit — is your MCP tool manifest compromised?
 sentinel supply-chain http://localhost:3001
 sentinel supply-chain http://localhost:3001 --ai   # + Claude semantic analysis
+
+# Multi-agent trust analysis — detect A2A trust violations in your codebase
+sentinel a2a ./agents/
+sentinel a2a multi_agent.py --fail-on HIGH
 
 # Static posture scan
 sentinel scan my_agent.py
@@ -253,6 +257,54 @@ sentinel discover --format json
 
 ---
 
+### `sentinel a2a` — multi-agent trust analysis
+
+Scans Python agent source files and builds a call graph showing which agents call which, then audits the trust boundaries between them. Detects the attack paths that single-agent tools miss entirely: injection that propagates across agent boundaries, unbounded agent spawning, and code-execution agents that accept delegated instructions without verification.
+
+Supports **LangChain / LangGraph**, **AutoGen**, and **CrewAI**. No API key required.
+
+```bash
+sentinel a2a ./agents/
+sentinel a2a multi_agent.py
+sentinel a2a . --fail-on HIGH
+sentinel a2a . --format json
+sentinel a2a . --ignore-rule A2A01_UNVERIFIED_ORCHESTRATOR  # suppress if handled at infra layer
+```
+
+**Rules:**
+
+| Rule | Severity | What it catches |
+|------|----------|-----------------|
+| `A2A03_IMPLICIT_TRUST` | CRITICAL | Code-execution agent accepts calls from other agents with no caller verification |
+| `A2A04_PROMPT_PASSTHROUGH` | HIGH | User input flows directly across an agent boundary without sanitization |
+| `A2A02_UNBOUNDED_SPAWNING` | HIGH | Agent is instantiated inside a loop — unbounded agent creation risk |
+| `A2A06_CIRCULAR_DELEGATION` | HIGH | Cycle in the call graph — agents can loop indefinitely under injection |
+| `A2A05_UNSCOPED_DELEGATION` | MEDIUM | Orchestrator delegates its full tool set to a sub-agent instead of a restricted subset |
+| `A2A01_UNVERIFIED_ORCHESTRATOR` | LOW | Agents receive instructions from other agents with no visible trust verification |
+
+**Example output:**
+
+```
+  2 agents  1 edges  1 max depth  acyclic
+
+  Agent         Framework   Role          Tools
+  planner       autogen     worker        —
+  executor      autogen     orchestrator  —    ⚠ code exec
+
+  Call graph:
+    executor ──► planner  initiate_chat  passes input
+
+  ● HIGH      A2A04_PROMPT_PASSTHROUGH  ASI01
+              User input flows directly from 'executor' to 'planner'
+              without sanitization at the agent boundary.
+
+  Trust Score   75/100  ███████████████░░░░░  WATCH
+```
+
+Covers **ASI07** (Insecure Inter-Agent Communication) from OWASP Top 10 for Agentic Applications 2026.
+
+---
+
 ## Finding suppression
 
 Use `--ignore-rule` to suppress specific findings by rule ID. Suppressed findings are excluded from `--fail-on` evaluation and output — they don't break CI gates.
@@ -278,7 +330,7 @@ SC03_HIDDEN_NETWORK_FIELDS  # webhook field verified safe — used for audit log
 NO_AUTH                     # server is behind an authenticated reverse proxy
 ```
 
-Supported on: `sentinel scan`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel secrets`, `sentinel inspect`.
+Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel secrets`, `sentinel inspect`.
 
 ---
 
@@ -292,7 +344,7 @@ Supported on: `sentinel scan`, `sentinel mcp scan`, `sentinel supply-chain`, `se
 | **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI), **`sentinel agentic`** |
 | Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` |
 | **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination), **`sentinel agentic`** |
-| Insecure Inter-Agent Communication | ASI07 | `sentinel agentic` (reasoning layer) |
+| **Insecure Inter-Agent Communication** | **ASI07** | **`sentinel a2a`** (call graph + trust rules), `sentinel agentic` (semantic reasoning) |
 | Cascading Agent Failures | ASI08 | `sentinel agentic` (cross-finding chain analysis) |
 | Human-Agent Trust Exploitation | ASI09 | `sentinel agentic` (narrative + evidence standard) |
 | Rogue Agents | ASI10 | `sentinel agentic` (drift detection across sessions) |
@@ -326,6 +378,9 @@ jobs:
 
       - name: MCP security audit
         run: sentinel mcp scan http://localhost:3001 --fail-on CRITICAL
+
+      - name: Multi-agent trust analysis
+        run: sentinel a2a ./agents/ --fail-on HIGH
 ```
 
 Use a `.sentinelignore` file at the repo root to suppress known-accepted findings without weakening the gate threshold:
@@ -346,6 +401,7 @@ MISSING_RATE_LIMIT    # rate limiting handled at infra layer
 | Investigating a specific server or codebase | `sentinel agentic` |
 | First assessment of a new MCP server | `sentinel agentic` |
 | Scheduled nightly security check | `sentinel agentic` (memory tracks drift) |
+| Auditing a multi-agent codebase | `sentinel a2a` (call graph + trust rules) |
 | Quick local sanity check | `sentinel mcp scan`, `sentinel scan` |
 | Red-teaming a live agent endpoint | `sentinel ai-probe` |
 
@@ -355,7 +411,7 @@ MISSING_RATE_LIMIT    # rate limiting handled at infra layer
 
 - Python 3.10+
 - `ANTHROPIC_API_KEY` required for: `sentinel agentic`, `sentinel ai-probe`, `sentinel supply-chain --ai`, `sentinel inspect` (AI summary)
-- No API key required for: `sentinel scan`, `sentinel secrets`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel probe`, `sentinel discover`, `sentinel inspect --no-ai`
+- No API key required for: `sentinel scan`, `sentinel a2a`, `sentinel secrets`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel probe`, `sentinel discover`, `sentinel inspect --no-ai`
 
 ---
 
