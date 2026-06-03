@@ -148,6 +148,7 @@ sentinel scan my_agent.py
 sentinel scan ./agents/
 sentinel scan my_agent.py --fail-on CRITICAL    # CI gate
 sentinel scan my_agent.py --format json
+sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT  # suppress known-accepted finding
 ```
 
 **Rules:**
@@ -252,6 +253,35 @@ sentinel discover --format json
 
 ---
 
+## Finding suppression
+
+Use `--ignore-rule` to suppress specific findings by rule ID. Suppressed findings are excluded from `--fail-on` evaluation and output — they don't break CI gates.
+
+```bash
+# Suppress a single finding for one run
+sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT
+
+# Stack multiple suppressions
+sentinel mcp scan http://localhost:3001 --fail-on CRITICAL \
+  --ignore-rule NO_AUTH \
+  --ignore-rule UNBOUNDED_INPUT
+```
+
+For project-level suppressions, create a **`.sentinelignore`** file in your project root. sentinel walks up from the target directory to find it — the same discovery pattern as `.gitignore`.
+
+```
+# .sentinelignore
+# Comments start with #
+
+MISSING_RATE_LIMIT          # rate limiting enforced at API gateway
+SC03_HIDDEN_NETWORK_FIELDS  # webhook field verified safe — used for audit logging
+NO_AUTH                     # server is behind an authenticated reverse proxy
+```
+
+Supported on: `sentinel scan`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel secrets`, `sentinel inspect`.
+
+---
+
 ## OWASP Top 10 for Agentic Applications 2026 coverage
 
 | OWASP Risk | ID | sentinel coverage |
@@ -298,6 +328,13 @@ jobs:
         run: sentinel mcp scan http://localhost:3001 --fail-on CRITICAL
 ```
 
+Use a `.sentinelignore` file at the repo root to suppress known-accepted findings without weakening the gate threshold:
+
+```
+# .sentinelignore — committed to source control
+MISSING_RATE_LIMIT    # rate limiting handled at infra layer
+```
+
 ---
 
 ## When to use analyst mode vs. static mode
@@ -305,6 +342,7 @@ jobs:
 | Situation | Use |
 |-----------|-----|
 | CI/CD gate on every PR | Static rules (`--fail-on CRITICAL`) |
+| Adopting CI gates incrementally | Static rules + `.sentinelignore` to suppress accepted risks |
 | Investigating a specific server or codebase | `sentinel agentic` |
 | First assessment of a new MCP server | `sentinel agentic` |
 | Scheduled nightly security check | `sentinel agentic` (memory tracks drift) |

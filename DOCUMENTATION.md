@@ -20,6 +20,7 @@ No server required. No Docker. Works on any Python agent file or live HTTP endpo
   - [sentinel mcp scan](#sentinel-mcp-scan)
   - [sentinel probe](#sentinel-probe)
   - [sentinel ai-probe](#sentinel-ai-probe)
+- [Finding Suppression](#finding-suppression)
 - [Real-World Workflows](#real-world-workflows)
 - [CI/CD Integration](#cicd-integration)
 - [Reference](#reference)
@@ -119,6 +120,7 @@ TARGET can be a Python file, a directory, or a live HTTP endpoint URL.
 | `--model TEXT` | `claude-haiku-4-5-20251001` | Claude model for AI summary |
 | `--auth-header HEADER` | — | HTTP auth header for live endpoints, e.g. `Authorization: Bearer token` |
 | `--fail-on [CRITICAL\|HIGH\|MEDIUM\|LOW]` | — | Exit code 1 if findings reach this severity |
+| `--ignore-rule RULE_ID` | — | Suppress a finding by rule ID. Repeatable. Also reads `.sentinelignore` in the target directory |
 
 #### What it shows
 
@@ -154,6 +156,9 @@ sentinel inspect http://my-agent.internal/chat \
 
 # JSON output — pipe into jq, SIEM, dashboards
 sentinel inspect my_agent.py --format json | jq '.fingerprint'
+
+# Suppress a known-accepted finding while still gating on CRITICAL
+sentinel inspect my_agent.py --fail-on CRITICAL --ignore-rule DANGEROUS_GRANTS
 
 # CI gate — fail if any CRITICAL finding
 sentinel inspect my_agent.py --fail-on CRITICAL
@@ -220,6 +225,7 @@ TARGET defaults to `.` (current directory, scanned recursively).
 |------|---------|-------------|
 | `--format [text\|json]` | `text` | Output format |
 | `--fail-on [CRITICAL\|HIGH\|MEDIUM\|LOW]` | — | Exit code 1 if findings reach this severity |
+| `--ignore-rule RULE_ID` | — | Suppress a finding by rule ID. Repeatable. Also reads `.sentinelignore` in the target directory |
 | `--connect URL` | — | Pull live behavior data from a running AgentSentinel instance |
 | `--api-key TEXT` | `$AGENTSENTINEL_API_KEY` | API key for `--connect` |
 
@@ -268,6 +274,14 @@ sentinel scan my_agent.py --format json
 
 # Include live behavior data from a running AgentSentinel instance
 sentinel scan my_agent.py --connect http://localhost:9000 --api-key $AGENTSENTINEL_KEY
+
+# Suppress a noisy LOW finding and still gate on HIGH
+sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT
+
+# Stack multiple suppressions
+sentinel scan ./agents/ --fail-on CRITICAL \
+  --ignore-rule MISSING_RATE_LIMIT \
+  --ignore-rule TOOL_SPRAWL
 ```
 
 #### Example output
@@ -342,6 +356,7 @@ sentinel secrets ~/.claude/projects/ --severity LOW
 | `--format [text\|json]` | `text` | Output format |
 | `--fail-on [CRITICAL\|HIGH\|MEDIUM\|LOW]` | — | Exit code 1 if findings reach this severity |
 | `--no-redact` | off | Show full matched values instead of masking them |
+| `--ignore-rule RULE_ID` | — | Suppress a finding by rule ID. Repeatable. Also reads `.sentinelignore` in the target directory |
 
 #### Choosing the right scope
 
@@ -597,8 +612,8 @@ Common false positives and how to handle them:
 | `SG_UEN` | 9-digit numbers that happen to end in a letter | UENs are common in business documents — confirm the surrounding context |
 
 If a finding is a confirmed false positive, it does not affect the finding count for `--fail-on`
-evaluation — you still need to address it or suppress it by restructuring the content.
-Suppression via ignore-lists is not yet implemented (planned for v0.6).
+evaluation — you still need to address it, suppress it with `--ignore-rule`, or restructure the
+content to remove the match. See [Finding Suppression](#finding-suppression).
 
 ---
 
@@ -692,6 +707,7 @@ sentinel mcp scan --stdio "CMD" [OPTIONS]
 | `--format [text\|json]` | `text` | Output format |
 | `--timeout SECONDS` | `10.0` | Connection timeout |
 | `--fail-on [CRITICAL\|HIGH\|MEDIUM\|LOW]` | — | Exit code 1 if findings reach this severity |
+| `--ignore-rule RULE_ID` | — | Suppress a finding by rule ID. Repeatable. Also reads `.sentinelignore` in the working directory |
 
 #### Transport support
 
@@ -740,6 +756,9 @@ sentinel mcp scan http://localhost:3000 --fail-on CRITICAL
 
 # Longer timeout for slow servers
 sentinel mcp scan http://remote-server.com/mcp --timeout 30
+
+# CI gate — suppress a finding accepted at the infrastructure layer
+sentinel mcp scan http://localhost:3000 --fail-on CRITICAL --ignore-rule NO_AUTH
 ```
 
 #### Example output
@@ -958,6 +977,87 @@ sentinel ai-probe http://my-agent.com/chat --fail-on CRITICAL
 
 ---
 
+## Finding Suppression
+
+Use `--ignore-rule` and `.sentinelignore` to suppress specific findings by rule ID. Suppressed findings are excluded from both output display and `--fail-on` evaluation — they never break a CI gate.
+
+Supported commands: `sentinel scan`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel secrets`, `sentinel inspect`.
+
+### --ignore-rule flag
+
+Suppress one or more rules for a single run. The flag is repeatable.
+
+```bash
+# Suppress a single rule
+sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT
+
+# Stack multiple suppressions
+sentinel mcp scan http://localhost:3001 --fail-on CRITICAL \
+  --ignore-rule NO_AUTH \
+  --ignore-rule UNBOUNDED_INPUT
+
+# Suppress during secrets scan
+sentinel secrets . --fail-on HIGH --ignore-rule SG_UEN
+```
+
+### .sentinelignore file
+
+For persistent, project-level suppressions, create a `.sentinelignore` file and commit it to source control. sentinel walks up from the target directory to find it — same discovery pattern as `.gitignore`.
+
+```
+# .sentinelignore
+
+# Comments start with #. Blank lines are ignored.
+# Rule IDs are case-insensitive.
+
+MISSING_RATE_LIMIT          # rate limiting enforced at API gateway layer
+SC03_HIDDEN_NETWORK_FIELDS  # webhook field is for audit logging — verified safe
+NO_AUTH                     # MCP server is behind an authenticated reverse proxy
+```
+
+sentinel searches for `.sentinelignore` starting from the target path and walking up to the filesystem root. For URL targets (`sentinel mcp scan`, `sentinel supply-chain`), it searches from the current working directory.
+
+### Suppression notice
+
+When findings are suppressed, sentinel prints a dim notice at the end of text output:
+
+```
+  1 finding suppressed by .sentinelignore / --ignore-rule: MISSING_RATE_LIMIT
+```
+
+In JSON output, suppressed findings are absent from the `findings` array. The `--fail-on` threshold is evaluated only against the active (non-suppressed) findings.
+
+### What to suppress — and what not to
+
+Suppressions are appropriate for findings where the risk is genuinely accepted at another layer:
+
+| Scenario | Appropriate suppression |
+|----------|------------------------|
+| Rate limiting handled at API gateway | `MISSING_RATE_LIMIT` |
+| MCP server behind authenticated proxy | `NO_AUTH` |
+| Known webhook field verified safe | `SC03_HIDDEN_NETWORK_FIELDS` |
+| Agent description intentionally omitted | `UNDESCRIBED_WRITE_AGENT` |
+
+Do not suppress CRITICAL findings (`EXFILTRATION_PATH`, `CODE_EXECUTION_GRANT`, `HARDCODED_CREDENTIALS`, `SC01_DESCRIPTION_INJECTION`) without a very specific, documented reason. These represent confirmed active risk paths, not configuration preferences.
+
+### Incremental CI adoption
+
+The `.sentinelignore` + `--fail-on` combination is the recommended way to adopt CI gates incrementally:
+
+```bash
+# Week 1 — gate only on CRITICAL, suppress anything that isn't actually critical
+sentinel scan ./agents/ --fail-on CRITICAL
+
+# Week 2 — raise threshold to HIGH, suppress accepted HIGH findings
+echo "DANGEROUS_GRANTS" >> .sentinelignore
+sentinel scan ./agents/ --fail-on HIGH
+
+# Week 3 — full posture gate, suppressions document accepted risk
+sentinel scan ./agents/ --fail-on MEDIUM
+```
+
+---
+
 ## Real-World Workflows
 
 ### Workflow 1: Unknown agent found in production
@@ -1121,6 +1221,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        # .sentinelignore in the repo root is picked up automatically
 
       - name: Install sentinel
         run: pip install "agentsentinel-cli[all]"
@@ -1144,6 +1245,13 @@ jobs:
 
       - name: MCP scan
         run: sentinel mcp scan http://localhost:3000 --fail-on CRITICAL
+```
+
+Add a `.sentinelignore` at the repo root to suppress known-accepted findings without weakening the gate threshold:
+
+```
+# .sentinelignore — committed to source control
+MISSING_RATE_LIMIT    # rate limiting handled at infra layer
 ```
 
 ### GitLab CI

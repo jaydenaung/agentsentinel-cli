@@ -35,12 +35,15 @@ def main() -> None:
               help="AgentSentinel API URL for live behavior data (e.g. http://localhost:9000).")
 @click.option("--api-key", envvar="AGENTSENTINEL_API_KEY", default=None,
               help="API key for --connect. Defaults to $AGENTSENTINEL_API_KEY.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
 def scan(
     target: Path,
     fmt: str,
     fail_on: str | None,
     connect: str | None,
     api_key: str | None,
+    ignore_rules: tuple[str, ...],
 ) -> None:
     """Scan a Python file or directory for AI agent security issues.
 
@@ -54,10 +57,24 @@ def scan(
         sentinel scan my_agent.py --format json
         sentinel scan my_agent.py --connect http://localhost:9000
     """
+    from agentsentinel_cli import suppress as _suppress
+
     agents = scan_path(target)
 
     findings_map = {a.file: run_rules(a) for a in agents}
     scores_map = {a.file: posture_score(findings_map[a.file]) for a in agents}
+
+    # Apply suppressions before display and --fail-on evaluation
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(target), ignore_rules)
+    all_suppressed: list = []
+    if sup_rules:
+        cleaned: dict = {}
+        for file, file_findings in findings_map.items():
+            active, suppressed = _suppress.apply(file_findings, sup_rules)
+            cleaned[file] = active
+            all_suppressed.extend(suppressed)
+        findings_map = cleaned
+        scores_map = {a.file: posture_score(findings_map[a.file]) for a in agents}
 
     if connect and api_key and agents:
         _enrich_from_platform(agents, scores_map, connect, api_key)
@@ -66,6 +83,9 @@ def scan(
         click.echo(as_json(agents, findings_map, scores_map))
     else:
         print_scan_result(agents, findings_map, scores_map, target, connect_url=connect)
+        msg = _suppress.notice(all_suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
 
     if fail_on:
         _severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
@@ -218,6 +238,8 @@ def mcp_group() -> None:
               help="Connection timeout in seconds.")
 @click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None,
               help="Exit with code 1 if findings at or above this severity exist.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
 def mcp_scan(
     target: str | None,
     stdio_cmd: str | None,
@@ -225,6 +247,7 @@ def mcp_scan(
     fmt: str,
     timeout: float,
     fail_on: str | None,
+    ignore_rules: tuple[str, ...],
 ) -> None:
     """Enumerate an MCP server's tools and audit for security issues.
 
@@ -285,14 +308,22 @@ def mcp_scan(
         console.print(f"\n[red]Unexpected error:[/red] {exc}")
         sys.exit(1)
 
+    from agentsentinel_cli import suppress as _suppress
+
     ctx = McpContext(server=server, auth_required=auth_required)
     findings = run_mcp_rules(ctx)
+
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(Path.cwd()), ignore_rules)
+    findings, suppressed = _suppress.apply(findings, sup_rules)
     score = mcp_posture_score(findings)
 
     if fmt == "json":
         click.echo(as_mcp_json(ctx, findings, score, display_target))
     else:
         print_mcp_result(ctx, findings, score, display_target)
+        msg = _suppress.notice(suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
 
     if fail_on:
         _severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
@@ -534,6 +565,8 @@ def ai_probe(
               help="HTTP auth header for live endpoint inspection, e.g. 'Authorization: Bearer token'.")
 @click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
               default=None, help="Exit with code 1 if findings at or above this severity exist.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
 def inspect(
     target: str,
     fmt: str,
@@ -541,6 +574,7 @@ def inspect(
     model: str,
     auth_header: str | None,
     fail_on: str | None,
+    ignore_rules: tuple[str, ...],
 ) -> None:
     """Generate an intelligence report for an AI agent.
 
@@ -559,6 +593,7 @@ def inspect(
     import os
     from agentsentinel_cli.inspect import inspect_file, inspect_live
     from agentsentinel_cli.inspect_report import print_inspect_result, as_inspect_json
+    from agentsentinel_cli import suppress as _suppress
 
     api_key = "" if skip_ai else os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -591,10 +626,14 @@ def inspect(
             if not agents:
                 console.print(f"[yellow]No agent files detected in:[/yellow] {target}")
                 sys.exit(0)
+            sup_rules = _suppress.merge(_suppress.load_ignore_file(path), ignore_rules)
             reports = []
+            all_suppressed: list = []
             for agent in agents:
                 r = _inspect(agent.file, api_key=api_key, summary_model=model)
                 if r:
+                    r.findings, suppressed = _suppress.apply(r.findings, sup_rules)
+                    all_suppressed.extend(suppressed)
                     reports.append(r)
             if fmt == "json":
                 import json as _json
@@ -602,6 +641,9 @@ def inspect(
             else:
                 for r in reports:
                     print_inspect_result(r)
+                msg = _suppress.notice(all_suppressed)
+                if msg:
+                    console.print(f"  {msg}\n")
             if fail_on:
                 _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
                 threshold = _rank.get(fail_on, 0)
@@ -615,10 +657,18 @@ def inspect(
             console.print("  Is this an agent file with @tool decorators, Tool() definitions, or known framework imports?")
             sys.exit(0)
 
+    # Apply suppressions for single-file and live-URL inspect
+    _sup_base = Path(target) if not (target.startswith("http://") or target.startswith("https://")) else Path.cwd()
+    _sup_rules = _suppress.merge(_suppress.load_ignore_file(_sup_base), ignore_rules)
+    report.findings, _suppressed = _suppress.apply(report.findings, _sup_rules)
+
     if fmt == "json":
         click.echo(as_inspect_json(report))
     else:
         print_inspect_result(report)
+        msg = _suppress.notice(_suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
 
     if fail_on:
         _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
@@ -644,6 +694,8 @@ def inspect(
               help="Exit with code 1 if findings at or above this severity exist.")
 @click.option("--no-redact", is_flag=True, default=False,
               help="Show full matched values instead of redacting them.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
 def secrets(
     target: Path,
     scope: str,
@@ -651,6 +703,7 @@ def secrets(
     fmt: str,
     fail_on: str | None,
     no_redact: bool,
+    ignore_rules: tuple[str, ...],
 ) -> None:
     """Scan for exposed secrets, API keys, and PII in agent files and memory.
 
@@ -693,12 +746,20 @@ def secrets(
             scan_secrets(target, scope=scope, redact=not no_redact, progress_cb=_on_progress)
         )
 
+    from agentsentinel_cli import suppress as _suppress
+
     report = _report_holder[0]
+
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(target), ignore_rules)
+    report.findings, suppressed = _suppress.apply(report.findings, sup_rules)
 
     if fmt == "json":
         click.echo(as_secrets_json(report))
     else:
         print_secrets_result(report, min_severity=severity)
+        msg = _suppress.notice(suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
 
     if fail_on:
         _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
@@ -861,6 +922,8 @@ def agentic(
               help="Connection timeout in seconds.")
 @click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
               default=None, help="Exit with code 1 if findings at or above this severity exist.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
 def supply_chain(
     target: str | None,
     stdio_cmd: str | None,
@@ -872,6 +935,7 @@ def supply_chain(
     fmt: str,
     timeout: float,
     fail_on: str | None,
+    ignore_rules: tuple[str, ...],
 ) -> None:
     """Audit an MCP server's tool manifest for supply chain compromise.
 
@@ -1004,6 +1068,10 @@ def supply_chain(
             console.print(f"\n[yellow]AI analysis failed:[/yellow] {exc}")
             console.print("  [dim]Continuing with static results only.[/dim]")
 
+    from agentsentinel_cli import suppress as _suppress
+
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(Path.cwd()), ignore_rules)
+    findings, suppressed = _suppress.apply(findings, sup_rules)
     score = supply_chain_score(findings)
 
     # ── Output ────────────────────────────────────────────────────────────────
@@ -1014,11 +1082,75 @@ def supply_chain(
             ctx, findings, score, display_target,
             used_ai=use_ai, baseline_path=baseline_path,
         )
+        msg = _suppress.notice(suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
 
     if fail_on:
         _severity_rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
         threshold = _severity_rank.get(fail_on, 0)
         if any(_severity_rank.get(f.severity, 0) >= threshold for f in findings):
+            sys.exit(1)
+
+
+# ── sentinel a2a ──────────────────────────────────────────────────────────────
+
+@main.command(name="a2a")
+@click.argument("target", default=".", type=click.Path(exists=True, path_type=Path))
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text",
+              help="Output format.")
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
+              default=None, help="Exit with code 1 if findings at or above this severity exist.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
+def a2a(
+    target: Path,
+    fmt: str,
+    fail_on: str | None,
+    ignore_rules: tuple[str, ...],
+) -> None:
+    """Analyse multi-agent trust boundaries in a codebase.
+
+    Detects agent-to-agent call graphs and audits for trust violations:
+    unverified orchestrators, unbounded spawning, prompt passthrough,
+    unscoped delegation, and circular delegation.
+
+    Supports LangChain/LangGraph, AutoGen, and CrewAI patterns.
+    TARGET can be a single .py file or a directory (scanned recursively).
+
+    \b
+    Examples:
+        sentinel a2a .
+        sentinel a2a ./agents/
+        sentinel a2a multi_agent.py
+        sentinel a2a . --fail-on HIGH
+        sentinel a2a . --format json
+        sentinel a2a . --ignore-rule A2A01_UNVERIFIED_ORCHESTRATOR
+    """
+    from agentsentinel_cli.a2a_scanner import scan_path
+    from agentsentinel_cli.a2a_rules import run_a2a_rules, a2a_posture_score
+    from agentsentinel_cli.a2a_report import print_a2a_result, as_a2a_json
+    from agentsentinel_cli import suppress as _suppress
+
+    graph    = scan_path(target)
+    findings = run_a2a_rules(graph)
+
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(target), ignore_rules)
+    findings, suppressed = _suppress.apply(findings, sup_rules)
+    score = a2a_posture_score(findings)
+
+    if fmt == "json":
+        click.echo(as_a2a_json(graph, findings, score, str(target)))
+    else:
+        print_a2a_result(graph, findings, score, str(target))
+        msg = _suppress.notice(suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
+
+    if fail_on:
+        _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+        threshold = _rank.get(fail_on, 0)
+        if any(_rank.get(f.severity, 0) >= threshold for f in findings):
             sys.exit(1)
 
 
