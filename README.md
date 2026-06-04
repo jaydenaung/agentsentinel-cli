@@ -25,6 +25,7 @@ pipx install agentsentinel-cli
 | `sentinel secrets` | Are credentials or PII exposed in these files? |
 | `sentinel inspect` | What framework, model, and role is this agent? |
 | `sentinel a2a` | Are multi-agent trust boundaries safe? |
+| `sentinel host-scan` | What is my local AI security posture? |
 
 ---
 
@@ -48,6 +49,10 @@ sentinel a2a ./agents/
 # Secrets and credentials
 sentinel secrets .
 sentinel secrets ~/.claude/projects/   # scan Claude Code memory
+
+# Local AI security posture — no network calls
+sentinel host-scan
+sentinel host-scan --fail-on HIGH
 ```
 
 ---
@@ -284,6 +289,52 @@ Covers **ASI07** (Insecure Inter-Agent Communication).
 
 ---
 
+### `sentinel host-scan` — local AI security posture audit
+
+Audits your machine's AI security posture without any network calls. Reads Claude Code and Claude Desktop configurations, shell credential files, macOS privacy permissions (TCC), system security settings, and running AI processes.
+
+```bash
+sentinel host-scan
+sentinel host-scan --format json
+sentinel host-scan --fail-on HIGH
+sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
+```
+
+**What it checks:**
+- **Claude Code** — `allowedTools` (Bash bypass), MCP server configs, shell hooks
+- **Claude Desktop** — MCP server configs
+- **Shell configs** — hardcoded AI API keys in `.zshrc`, `.bashrc`, `.zprofile`, etc.
+- **macOS TCC permissions** — Full Disk Access, Screen Recording, Accessibility granted to AI apps
+- **macOS system security** — SIP, FileVault, Gatekeeper status
+- **Exposed AI processes** — AI-related processes listening on non-localhost network interfaces
+- **Memory footprint** — Claude Code conversation memory size in `~/.claude/projects/`
+
+**Rules:**
+
+| Rule | Severity | Category | What it catches |
+|------|----------|----------|-----------------|
+| `HOST_SHELL_UNRESTRICTED` | CRITICAL | config | `Bash` in `allowedTools` — shell runs without confirmation prompt |
+| `HOST_SIP_DISABLED` | CRITICAL | system | macOS System Integrity Protection is off |
+| `HOST_API_KEY_IN_SHELL` | HIGH | data_exposure | AI API keys hardcoded in shell config files |
+| `HOST_MCP_EXFIL_PATH` | HIGH | config | MCP server has both filesystem access and network capability |
+| `HOST_FDA_AI_APP` | HIGH | permissions | Full Disk Access granted to an AI app or its terminal |
+| `HOST_SCREEN_RECORDING_AI` | HIGH | permissions | Screen Recording permission granted to an AI app |
+| `HOST_AI_PROCESS_EXPOSED` | HIGH | network | AI-related process listening on a non-localhost interface |
+| `HOST_FILEVAULT_OFF` | HIGH | system | FileVault disk encryption is disabled |
+| `HOST_ACCESSIBILITY_AI` | MEDIUM | permissions | Accessibility permission granted to an AI app |
+| `HOST_HOOKS_SHELL` | MEDIUM | config | Claude Code shell hooks that could interpolate AI output |
+| `HOST_MCP_BROAD_FS` | MEDIUM | config | MCP server configured with home-dir or root-level path |
+| `HOST_MCP_SENSITIVE_PATH` | MEDIUM | config | MCP server has access to `~/.ssh`, `~/.aws`, `~/.kube`, or Keychain |
+| `HOST_MANY_MCP_SERVERS` | MEDIUM | config | 8+ MCP servers installed — large prompt injection attack surface |
+| `HOST_GATEKEEPER_OFF` | MEDIUM | system | Gatekeeper disabled — unsigned binaries run without warning |
+| `HOST_LARGE_MEMORY` | LOW | data_exposure | Claude Code memory files exceed 50 MB of accumulated conversation data |
+
+Every finding includes a **remediation** step. The posture score (0–100) uses the same deduction weights as other sentinel commands: CRITICAL −40, HIGH −20, MEDIUM −10, LOW −5.
+
+No API key required. No network calls.
+
+---
+
 ## Finding suppression
 
 Use `--ignore-rule` to suppress findings by rule ID. Suppressed findings are excluded from `--fail-on` evaluation — they don't break CI gates.
@@ -313,13 +364,13 @@ Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel su
 |------------|-----|------------------|
 | Agent Goal Hijack | ASI01 | `sentinel scan` (PROMPT_INJECTION_VECTOR), `sentinel supply-chain` (SC01) |
 | Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan` |
-| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS) |
+| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED) |
 | **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI semantic analysis) |
 | Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` (CODE_EXECUTION_TOOL) |
-| **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination, system prompt leakage) |
+| **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination, system prompt leakage), `sentinel host-scan` (HOST_LARGE_MEMORY) |
 | **Insecure Inter-Agent Communication** | **ASI07** | **`sentinel a2a`** (call graph + trust rules) |
 | Cascading Agent Failures | ASI08 | `sentinel discover` (surface unmonitored agents) |
-| Rogue Agents | ASI10 | `sentinel discover` (find agents that shouldn't exist) |
+| Rogue Agents | ASI10 | `sentinel discover` (find agents that shouldn't exist), `sentinel host-scan` (HOST_AI_PROCESS_EXPOSED) |
 
 ---
 
@@ -353,6 +404,9 @@ jobs:
 
       - name: Multi-agent trust analysis
         run: sentinel a2a ./agents/ --fail-on HIGH
+
+      - name: Host AI security posture
+        run: sentinel host-scan --fail-on HIGH
 ```
 
 Use `.sentinelignore` at the repo root to suppress accepted risks without weakening the gate:
@@ -367,7 +421,7 @@ NO_AUTH    # server is behind an authenticated reverse proxy
 ## Requirements
 
 - Python 3.10+
-- No API key required for: `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`, `sentinel a2a`
+- No API key required for: `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`, `sentinel a2a`, `sentinel host-scan`
 - `ANTHROPIC_API_KEY` required for: `sentinel supply-chain --ai`, `sentinel inspect` (AI summary)
 
 ---

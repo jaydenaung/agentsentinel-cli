@@ -864,6 +864,76 @@ def a2a(
             sys.exit(1)
 
 
+# ── sentinel host ─────────────────────────────────────────────────────────────
+
+@main.command(name="host-scan")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text",
+              help="Output format.")
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
+              default=None, help="Exit with code 1 if findings at or above this severity exist.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
+def host(
+    fmt: str,
+    fail_on: str | None,
+    ignore_rules: tuple[str, ...],
+) -> None:
+    """Audit your local AI security posture.
+
+    Checks Claude Code and Desktop configurations, MCP server permissions,
+    shell credential exposure, macOS privacy permissions (Full Disk Access,
+    Screen Recording, Accessibility), system security (SIP, FileVault,
+    Gatekeeper), and AI processes exposed on the network.
+
+    No network calls — all checks are local and read-only.
+
+    \b
+    Examples:
+        sentinel host-scan
+        sentinel host-scan --format json
+        sentinel host-scan --fail-on HIGH
+        sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
+    """
+    from agentsentinel_cli.host_scanner import scan_host
+    from agentsentinel_cli.host_rules import run_host_rules, host_posture_score
+    from agentsentinel_cli.host_report import print_host_result, as_host_json
+    from agentsentinel_cli import suppress as _suppress
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    _ctx_holder: list = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[dim]{task.description}[/dim]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("Scanning host AI security posture…", total=None)
+        _ctx_holder.append(scan_host())
+
+    ctx = _ctx_holder[0]
+    findings = run_host_rules(ctx)
+
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(Path.cwd()), ignore_rules)
+    findings, suppressed = _suppress.apply(findings, sup_rules)
+    score = host_posture_score(findings)
+
+    if fmt == "json":
+        click.echo(as_host_json(ctx, findings, score))
+    else:
+        print_host_result(ctx, findings, score)
+        msg = _suppress.notice(suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
+
+    if fail_on:
+        _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+        threshold = _rank.get(fail_on, 0)
+        if any(_rank.get(f.severity, 0) >= threshold for f in findings):
+            sys.exit(1)
+
+
 def _parse_ports(ports_str: str) -> list[int]:
     """Parse '8000-9001' or '8000,8080,9000' into a list of ints."""
     ports: list[int] = []
