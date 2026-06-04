@@ -269,7 +269,6 @@ _ALL_RULES = [
     _rule_prompt_passthrough,
     _rule_implicit_trust_with_code_exec,
     _rule_unscoped_delegation,
-    _rule_unverified_orchestrator,
 ]
 
 _SEVERITY_WEIGHT = {"CRITICAL": 40, "HIGH": 20, "MEDIUM": 10, "LOW": 5}

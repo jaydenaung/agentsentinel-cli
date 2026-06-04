@@ -1,7 +1,7 @@
 """Minimal MCP (Model Context Protocol) client for security scanning.
 
-Implements the initialize + tools/list exchange over stdio and streamable-HTTP
-transports. Only what an auditor needs — no full MCP client dependency.
+Implements the initialize + tools/list exchange over stdio, streamable-HTTP,
+and legacy SSE transports. Only what an auditor needs — no full MCP client dependency.
 """
 
 import dataclasses
@@ -10,6 +10,7 @@ import queue
 import shlex
 import subprocess
 import threading
+import urllib.parse
 from typing import Any
 
 from agentsentinel_cli.scanner import classify_tool
@@ -79,6 +80,9 @@ def scan_http(
 ) -> McpServerInfo:
     """Scan an MCP server via streamable HTTP (POST-based) transport.
 
+    If the server responds with 405 or text/event-stream, automatically falls
+    back to the legacy SSE transport (GET /sse + POST /messages).
+
     Raises McpAuthRequired if the server requires credentials.
     Raises McpError for all other connection or protocol failures.
     """
@@ -104,19 +108,13 @@ def scan_http(
 
         if resp.status_code in (401, 403):
             raise McpAuthRequired(resp.status_code)
-        if resp.status_code == 405:
-            raise McpError(
-                "Server returned 405 Method Not Allowed. "
-                "This server may use the older SSE transport (GET /sse). "
-                "Try scanning it locally with: sentinel mcp scan --stdio 'python server.py'"
-            )
+        if resp.status_code in (404, 405):
+            # Server may use SSE transport — root path returns 404, /sse returns 405
+            return scan_sse(url, extra_headers=extra_headers, timeout=timeout)
 
         content_type = resp.headers.get("content-type", "")
         if "text/event-stream" in content_type:
-            raise McpError(
-                "Server responded with SSE stream (older transport). "
-                "Try scanning it locally with: sentinel mcp scan --stdio 'python server.py'"
-            )
+            return scan_sse(url, extra_headers=extra_headers, timeout=timeout)
 
         resp.raise_for_status()
         init_data = _parse_rpc_response(resp.text)
@@ -140,6 +138,132 @@ def scan_http(
         version=server_meta.get("version", "unknown"),
         tools=[_make_tool(t) for t in raw_tools],
         transport="http",
+    )
+
+
+def scan_sse(
+    url: str,
+    extra_headers: dict[str, str] | None = None,
+    timeout: float = 15.0,
+) -> McpServerInfo:
+    """Scan an MCP server via the legacy SSE transport (GET /sse + POST /messages).
+
+    FastMCP 0.x / mcp 1.x servers use this transport. The protocol is:
+      1. Client opens GET /sse — server streams SSE events back.
+      2. First event is  event: endpoint / data: /messages/?session_id=xxx
+      3. Client POSTs JSON-RPC requests to /messages/?session_id=xxx.
+      4. Server sends responses as SSE  data:  events on the open GET stream.
+
+    We handle the bidirectional exchange with a background reader thread that
+    drains the SSE stream into a queue while the main thread sends requests.
+    """
+    try:
+        import httpx
+    except ImportError:
+        raise McpError("httpx is required: pip install 'agentsentinel-cli[mcp]'")
+
+    # Normalise: /sse suffix accepted but not required
+    base = url.rstrip("/")
+    if not base.endswith("/sse"):
+        base = f"{base}/sse"
+
+    parsed = urllib.parse.urlparse(base)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    sse_headers: dict[str, str] = {"Accept": "text/event-stream"}
+    if extra_headers:
+        sse_headers.update(extra_headers)
+
+    event_q: queue.Queue[str | None] = queue.Queue()
+    endpoint_q: queue.Queue[str | None] = queue.Queue(maxsize=1)
+
+    def _sse_reader(client: "httpx.Client") -> None:
+        """Stream GET /sse, push data-line payloads into event_q."""
+        try:
+            with client.stream("GET", base, headers=sse_headers) as resp:
+                if resp.status_code in (401, 403):
+                    endpoint_q.put(None)
+                    return
+                resp.raise_for_status()
+                endpoint_sent = False
+                for line in resp.iter_lines():
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if not endpoint_sent:
+                            # First data line is the session endpoint path
+                            endpoint_q.put(data)
+                            endpoint_sent = True
+                        else:
+                            event_q.put(data)
+        except Exception:
+            endpoint_q.put(None)
+            event_q.put(None)
+
+    def _recv(wait: float) -> dict[str, Any]:
+        try:
+            payload = event_q.get(timeout=wait)
+        except queue.Empty:
+            raise McpError(f"No SSE response within {wait}s")
+        if payload is None:
+            raise McpError("SSE stream closed unexpectedly")
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError as exc:
+            raise McpError(f"Invalid JSON from SSE stream: {exc}") from exc
+
+    with httpx.Client(timeout=timeout) as client:
+        reader = threading.Thread(target=_sse_reader, args=(client,), daemon=True)
+        reader.start()
+
+        # Wait for the session endpoint URL
+        try:
+            session_path = endpoint_q.get(timeout=timeout)
+        except queue.Empty:
+            raise McpError("SSE server did not send an endpoint URL in time")
+        if session_path is None:
+            raise McpAuthRequired(401)
+
+        # Build the absolute messages URL
+        if session_path.startswith("http"):
+            messages_url = session_path
+        else:
+            messages_url = f"{origin}{session_path}"
+
+        post_headers: dict[str, str] = {"Content-Type": "application/json"}
+        if extra_headers:
+            post_headers.update(extra_headers)
+
+        # initialize
+        resp = client.post(messages_url, json=_rpc("initialize", {
+            "protocolVersion": _PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": _CLIENT_INFO,
+        }, 1), headers=post_headers)
+        if resp.status_code in (401, 403):
+            raise McpAuthRequired(resp.status_code)
+        resp.raise_for_status()
+        init_data = _recv(timeout)
+
+        # initialized notification — fire and forget
+        client.post(messages_url, json={
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {},
+        }, headers=post_headers)
+
+        # tools/list
+        resp = client.post(messages_url, json=_rpc("tools/list", {}, 2), headers=post_headers)
+        resp.raise_for_status()
+        tools_data = _recv(timeout)
+
+    server_meta = init_data.get("result", {}).get("serverInfo", {})
+    raw_tools = tools_data.get("result", {}).get("tools", [])
+
+    return McpServerInfo(
+        name=server_meta.get("name", "unknown"),
+        version=server_meta.get("version", "unknown"),
+        tools=[_make_tool(t) for t in raw_tools],
+        transport="sse",
     )
 
 

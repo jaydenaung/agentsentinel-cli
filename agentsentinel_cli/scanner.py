@@ -74,6 +74,16 @@ _CRED_PREFIXES = (
 )
 _CRED_REGEX = re.compile(r'^[A-Za-z0-9+/\-_]{32,}={0,2}$')
 
+# Modern agent construction patterns that receive a tools list as an argument
+_AGENT_CALLER_FUNCS = frozenset({
+    "create_react_agent",
+    "create_tool_calling_agent",
+    "create_openai_tools_agent",
+    "create_openai_functions_agent",
+    "create_agent",
+    "initialize_agent",
+})
+
 
 def _classify(name: str) -> tuple[str, bool]:
     lower = name.lower()
@@ -149,6 +159,39 @@ class _AgentFileVisitor(ast.NodeVisitor):
             category=_categorize(name),
         ))
 
+    def _extract_tool_names(self, node: "ast.expr | None", source: str) -> None:
+        """Extract tool names from a tools=[...] argument.
+
+        Handles three forms:
+          - Variable references: [list_directory, search_web] → name is the variable name
+          - Anthropic API dicts: [{"name": "tool_name", "input_schema": {...}}]
+          - OpenAI API dicts:    [{"type": "function", "function": {"name": "tool_name"}}]
+        """
+        if not isinstance(node, ast.List):
+            return
+        for elt in node.elts:
+            if isinstance(elt, ast.Name):
+                self._add_tool(elt.id, source)
+            elif isinstance(elt, ast.Attribute):
+                self._add_tool(elt.attr, source)
+            elif isinstance(elt, ast.Dict):
+                for key, val in zip(elt.keys, elt.values):
+                    k = _get_string(key)
+                    if k == "name":
+                        name = _get_string(val)
+                        if name:
+                            self._add_tool(name, source)
+                        break
+                    if k == "function" and isinstance(val, ast.Dict):
+                        # OpenAI format: {"type": "function", "function": {"name": "..."}}
+                        for k2, v2 in zip(val.keys, val.values):
+                            if _get_string(k2) == "name":
+                                name = _get_string(v2)
+                                if name:
+                                    self._add_tool(name, source)
+                                break
+                        break
+
     # ------------------------------------------------------------------
     # @tool / @SentinelTool decorated functions
     # ------------------------------------------------------------------
@@ -194,6 +237,7 @@ class _AgentFileVisitor(ast.NodeVisitor):
         elif isinstance(node.func, ast.Attribute):
             func_name = node.func.attr
 
+        # ── Tool() / StructuredTool(name=...) constructors ────────────────────
         if func_name in ("Tool", "StructuredTool"):
             for kw in node.keywords:
                 if kw.arg == "name":
@@ -201,8 +245,52 @@ class _AgentFileVisitor(ast.NodeVisitor):
                     if tool_name:
                         self._add_tool(tool_name, f"{func_name}(name=...)")
 
+        # ── StructuredTool.from_function(name="...", coroutine=...) ───────────
+        if func_name == "from_function" and isinstance(node.func, ast.Attribute):
+            obj_name = node.func.value.id if isinstance(node.func.value, ast.Name) else ""
+            if obj_name in ("StructuredTool", "Tool"):
+                for kw in node.keywords:
+                    if kw.arg == "name":
+                        tool_name = _get_string(kw.value)
+                        if tool_name:
+                            self._add_tool(tool_name, f"{obj_name}.from_function()")
+
+        # ── bind_tools([tool1, tool2]) — modern LangChain ─────────────────────
+        if func_name == "bind_tools" and node.args:
+            self._extract_tool_names(node.args[0], "bind_tools()")
+
+        # ── create_react_agent(llm, tools) and family — LangGraph ────────────
+        if func_name in _AGENT_CALLER_FUNCS:
+            # tools is the second positional arg, or tools= keyword
+            tools_node = (
+                node.args[1] if len(node.args) >= 2
+                else next((kw.value for kw in node.keywords if kw.arg == "tools"), None)
+            )
+            self._extract_tool_names(tools_node, f"{func_name}()")
+
+        # ── AgentExecutor(tools=[...]) — LangChain executor ───────────────────
+        if func_name == "AgentExecutor":
+            tools_node = next((kw.value for kw in node.keywords if kw.arg == "tools"), None)
+            self._extract_tool_names(tools_node, "AgentExecutor()")
+
+        # ── Direct Anthropic / OpenAI API: messages.create(tools=[...]) ───────
+        if func_name == "create":
+            tools_node = next((kw.value for kw in node.keywords if kw.arg == "tools"), None)
+            if tools_node:
+                self._extract_tool_names(tools_node, "API tools list")
+            # Also capture model from direct API calls
+            if not self.model:
+                for kw in node.keywords:
+                    if kw.arg == "model":
+                        val = _get_string(kw.value)
+                        if val and any(val.startswith(p) for p in _KNOWN_MODELS):
+                            self.model = val
+                            break
+
+        # ── LLM constructor — model detection ────────────────────────────────
         if func_name in ("ChatAnthropic", "ChatOpenAI", "ChatGoogleGenerativeAI",
-                         "AzureChatOpenAI", "BedrockChat", "init_chat_model"):
+                         "AzureChatOpenAI", "BedrockChat", "init_chat_model",
+                         "Anthropic", "OpenAI"):
             for kw in node.keywords:
                 if kw.arg == "model":
                     val = _get_string(kw.value)

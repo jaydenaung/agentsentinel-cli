@@ -253,6 +253,10 @@ class _A2AVisitor(ast.NodeVisitor):
         self._tool_vars: set[str] = set()
         # Current assignment target name (so visit_Call knows the var being assigned)
         self._current_assign_target: str = ""
+        # MCP client detection
+        self._is_mcp_client: bool = False
+        self._mcp_server_urls: list[tuple[str, int]] = []   # (url, lineno)
+        self._string_assignments: dict[str, str] = {}       # var_name → string value
 
     # ── Pass 1: import collection ─────────────────────────────────────────────
 
@@ -260,6 +264,7 @@ class _A2AVisitor(ast.NodeVisitor):
         """Walk only Import/ImportFrom nodes to build _framework_names."""
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
+                self._check_mcp_client_import(node.module)
                 fw = self._module_to_framework(node.module)
                 if fw:
                     for alias in node.names:
@@ -267,10 +272,16 @@ class _A2AVisitor(ast.NodeVisitor):
                         self._framework_names[name] = fw
             elif isinstance(node, ast.Import):
                 for alias in node.names:
+                    self._check_mcp_client_import(alias.name)
                     fw = self._module_to_framework(alias.name)
                     if fw:
                         name = alias.asname or alias.name
                         self._framework_names[name] = fw
+
+    def _check_mcp_client_import(self, module: str) -> None:
+        """Flag file as an MCP client if it imports from mcp.client.*"""
+        if module.startswith("mcp.client") or module in ("mcp.client",):
+            self._is_mcp_client = True
 
     @staticmethod
     def _module_to_framework(module: str) -> str:
@@ -302,6 +313,11 @@ class _A2AVisitor(ast.NodeVisitor):
         """Track assignment targets so visit_Call knows the variable being assigned."""
         if node.targets and isinstance(node.targets[0], ast.Name):
             self._current_assign_target = node.targets[0].id
+            # Track string constant assignments for MCP URL resolution
+            # e.g. MCP_SERVER_URL = "http://127.0.0.1:8000/sse"
+            if (isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)):
+                self._string_assignments[self._current_assign_target] = node.value.value
         else:
             self._current_assign_target = ""
         self.generic_visit(node)
@@ -384,6 +400,10 @@ class _A2AVisitor(ast.NodeVisitor):
         # ── CrewAI: Crew(agents=[...]) assembles the topology ─────────────────
         elif func_name == "Crew":
             self._handle_crew(node)
+
+        # ── MCP client: sse_client(url) / streamablehttp_client(url) ─────────
+        elif func_name in ("sse_client", "streamablehttp_client", "stdio_client"):
+            self._handle_mcp_connect(node)
 
         self.generic_visit(node)
 
@@ -574,6 +594,84 @@ class _A2AVisitor(ast.NodeVisitor):
                     line=call.lineno,
                 ))
 
+    # ── MCP client helpers ────────────────────────────────────────────────────
+
+    def _handle_mcp_connect(self, call: ast.Call) -> None:
+        """sse_client(url, ...) — record the MCP server URL for post-processing."""
+        if not call.args:
+            return
+        url = _get_str(call.args[0])
+        if not url:
+            # Resolve variable reference: MCP_SERVER_URL = "http://..."
+            var_name = _get_name(call.args[0])
+            url = self._string_assignments.get(var_name, "")
+        if url:
+            self._mcp_server_urls.append((url, call.lineno))
+
+    def create_mcp_edges(self) -> None:
+        """Post-processing: synthesise AgentNode + edges for MCP client connections.
+
+        Called after the full AST visit once we know both the MCP client imports
+        and the server URLs. Creates one node for this file (the MCP client agent)
+        and one node per unique server, with directed edges between them.
+        """
+        if not self._is_mcp_client or not self._mcp_server_urls:
+            return
+
+        # Derive a human name for this agent from the file stem
+        client_name = self.file.stem.replace("_", "-")
+
+        # Detect whether the file has an LLM in the loop — if so, user input
+        # flows through the LLM into MCP tool calls (passes_user_input=True)
+        _LLM_FRAMEWORKS = frozenset({"langchain", "langgraph", "autogen", "crewai"})
+        has_llm = any(fw in _LLM_FRAMEWORKS for fw in self._framework_names.values())
+
+        # Create the client agent node if not already registered
+        if client_name not in self._var_to_node:
+            fw = next(
+                (fw for fw in self._framework_names.values() if fw in _LLM_FRAMEWORKS),
+                "mcp_client",
+            )
+            client_node = AgentNode(
+                name=client_name,
+                framework=fw,
+                role="mcp_client",
+                tools=[],
+                has_code_execution=False,
+                spawned_in_loop=False,
+                file=self.file,
+                line=1,
+            )
+            self.nodes.append(client_node)
+            self._var_to_node[client_name] = client_node
+
+        for url, lineno in self._mcp_server_urls:
+            server_name = f"mcp-server@{_url_to_host(url)}"
+
+            if server_name not in self._var_to_node:
+                server_node = AgentNode(
+                    name=server_name,
+                    framework="mcp_server",
+                    role="tool_provider",
+                    tools=[],
+                    has_code_execution=False,
+                    spawned_in_loop=False,
+                    file=self.file,
+                    line=lineno,
+                )
+                self.nodes.append(server_node)
+                self._var_to_node[server_name] = server_node
+
+            self.edges.append(A2AEdge(
+                caller=client_name,
+                callee=server_name,
+                call_type="mcp_connect",
+                passes_user_input=has_llm,
+                callee_tools_scoped=True,  # MCP server defines its own tool boundaries
+                file=self.file,
+                line=lineno,
+            ))
+
     # ── Unscoped delegation check (post-processing) ───────────────────────────
 
     def flag_unscoped_tool_delegation(self) -> None:
@@ -596,6 +694,16 @@ class _A2AVisitor(ast.NodeVisitor):
                     edge.callee_tools_scoped = False
 
 
+def _url_to_host(url: str) -> str:
+    """Extract host:port from a URL string for use as a node name."""
+    try:
+        # Strip scheme and path: "http://127.0.0.1:8000/sse" → "127.0.0.1:8000"
+        without_scheme = url.split("://", 1)[-1]
+        return without_scheme.split("/")[0]
+    except Exception:
+        return url
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def scan_file(path: Path) -> tuple[list[AgentNode], list[A2AEdge]]:
@@ -613,6 +721,7 @@ def scan_file(path: Path) -> tuple[list[AgentNode], list[A2AEdge]]:
     visitor.collect_imports(tree)
     visitor.collect_loop_lines(tree)
     visitor.visit(tree)
+    visitor.create_mcp_edges()
     visitor.flag_unscoped_tool_delegation()
 
     return visitor.nodes, visitor.edges

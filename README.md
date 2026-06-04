@@ -4,50 +4,50 @@
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/pypi/pyversions/agentsentinel-cli)](https://pypi.org/project/agentsentinel-cli/)
 
-**AI agent security — analyst mode, multi-agent trust analysis, static rules, red-team probing, and MCP auditing. No server. No Docker. One install.**
+**The nmap of AI agents and MCP servers. Deterministic. Protocol-based. No API key required.**
 
 ```bash
-pipx install "agentsentinel-cli[all]"
+pipx install agentsentinel-cli
 ```
 
 ---
 
 ## What it does
 
-`sentinel` covers 9 of the 10 risks in the [OWASP Top 10 for Agentic Applications 2026](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/).
+`sentinel` discovers and audits AI agents and MCP servers. Every result is deterministic — same input, same output, every time. No cloud dependency, no API key required for any scan.
 
-It operates at two levels:
-
-**Analyst mode** — Claude reasons across your entire agent environment, compares against what it remembered from last session, and writes a threat narrative. Catches things static rules never will: cross-finding chains, semantic deception, drift over time.
-
-**Static mode** — fast, deterministic, no API key required. Designed for CI/CD gates.
+| Command | What it answers |
+|---------|----------------|
+| `sentinel discover` | What MCP servers are running on this host or network? |
+| `sentinel mcp scan` | How secure is this specific MCP server? |
+| `sentinel supply-chain` | Has this MCP tool manifest been tampered with? |
+| `sentinel scan` | What security risks are in this agent's source code? |
+| `sentinel secrets` | Are credentials or PII exposed in these files? |
+| `sentinel inspect` | What framework, model, and role is this agent? |
+| `sentinel a2a` | Are multi-agent trust boundaries safe? |
 
 ---
 
 ## Quick start
 
 ```bash
-# Analyst mode — Claude examines your MCP server, remembers what it finds
-sentinel agentic http://localhost:3001
-sentinel agentic --stdio "python my_mcp_server.py"
-sentinel agentic ./my-agent/
-
-# Supply chain audit — is your MCP tool manifest compromised?
-sentinel supply-chain http://localhost:3001
-sentinel supply-chain http://localhost:3001 --ai   # + Claude semantic analysis
-
-# Multi-agent trust analysis — detect A2A trust violations in your codebase
-sentinel a2a ./agents/
-sentinel a2a multi_agent.py --fail-on HIGH
-
-# Static posture scan
-sentinel scan my_agent.py
-sentinel secrets .
-sentinel mcp scan http://localhost:3001
-sentinel probe http://localhost:3000
-sentinel ai-probe http://localhost:3000
-sentinel inspect my_agent.py
+# Discover MCP servers — local and across a network
 sentinel discover
+sentinel discover --host 10.0.1.45
+sentinel discover --subnet 10.0.0.0/24
+sentinel discover --subnet 10.0.0.0/24 --scan   # discover + deep audit in one pass
+
+# Audit a specific MCP server
+sentinel mcp scan http://localhost:8000/sse --auth-header "Authorization: Bearer token"
+sentinel supply-chain http://localhost:8000/sse
+
+# Scan agent source code
+sentinel scan ./agents/
+sentinel a2a ./agents/
+
+# Secrets and credentials
+sentinel secrets .
+sentinel secrets ~/.claude/projects/   # scan Claude Code memory
 ```
 
 ---
@@ -55,105 +55,143 @@ sentinel discover
 ## Install
 
 ```bash
-# Recommended — isolated install, no venv required
-pipx install "agentsentinel-cli[all]"
+# Zero dependencies — sentinel scan and sentinel a2a
+pip install agentsentinel-cli
 
-# Or with pip, install only what you need
-pip install agentsentinel-cli                   # sentinel scan (zero deps)
-pip install "agentsentinel-cli[agentic]"        # + sentinel agentic (needs ANTHROPIC_API_KEY)
-pip install "agentsentinel-cli[supply-chain]"   # + sentinel supply-chain
-pip install "agentsentinel-cli[mcp]"            # + sentinel mcp scan
-pip install "agentsentinel-cli[probe]"          # + sentinel probe
-pip install "agentsentinel-cli[ai-probe]"       # + sentinel ai-probe
-pip install "agentsentinel-cli[discover]"       # + sentinel discover
-pip install "agentsentinel-cli[all]"            # everything
+# + sentinel discover (psutil for process scanning)
+pip install "agentsentinel-cli[discover]"
+
+# + sentinel mcp scan, supply-chain, inspect (httpx)
+pip install "agentsentinel-cli[mcp]"
+
+# Everything
+pip install "agentsentinel-cli[all]"
+
+# Recommended — isolated install
+pipx install "agentsentinel-cli[all]"
 ```
 
 ---
 
 ## Commands
 
-### `sentinel agentic` — analyst mode with persistent memory
+### `sentinel discover` — find MCP servers and agent processes
 
-Claude acts as your security analyst. It reads its memory of prior assessments, decides what to scan, calls sentinel's capabilities as tools, reasons across the results, and produces a threat narrative.
-
-This is not a long system prompt. Claude makes real tool calls that invoke real scanning code, writes state to disk between sessions, and produces different outputs based on what changed — including findings that can only exist across sessions.
+Confirms MCP servers via protocol handshake — not just open ports. A result means the MCP `initialize` exchange completed.
 
 ```bash
-# Assess an MCP server
-sentinel agentic http://localhost:3001
+# Local scan — processes + localhost ports
+sentinel discover
 
-# Assess a stdio-transport server
-sentinel agentic --stdio "python my_mcp_server.py"
+# Single host
+sentinel discover --host 10.0.1.45
+sentinel discover --host 10.0.1.45 --auth-header "Authorization: Bearer token"
 
-# Assess agent source files
-sentinel agentic ./my-agent/
+# Subnet sweep
+sentinel discover --subnet 10.0.0.0/24
+sentinel discover --subnet 10.0.0.0/24 --auth-header "Authorization: Bearer token"
 
-# Add context for better threat modelling
-sentinel agentic http://localhost:3001 \
-  --context "production MCP server for a fintech data pipeline"
+# Discover + deep security audit in one pass
+sentinel discover --host 10.0.1.45 --scan
+sentinel discover --subnet 10.0.0.0/24 --scan
 
-# Use Opus for deeper analysis
-sentinel agentic http://localhost:3001 --model claude-opus-4-8
-
-# JSON output for CI or SIEM
-sentinel agentic http://localhost:3001 --format json --fail-on HIGH
+# Custom ports, Docker, JSON output
+sentinel discover --ports 8000-9000
+sentinel discover --docker
+sentinel discover --format json
 ```
 
-**What makes it different from static rules:**
+**How it works:**
+- Phase 1 — parallel TCP sweep across host:port combinations
+- Phase 2 — MCP protocol handshake on every open port (streamable-HTTP, falls back to SSE)
+- Auth enforcement verified: servers that accept unauthenticated connections stay CRITICAL even if you pass a token
 
-On a first run it produces findings from the scan. On a second run against the same target it compares current state to its memory — and produces findings like `PERSISTENT_PAYLOAD_TMP` (this threat survived a prior assessment without remediation) or `REGISTRY_DRIFT` (two tools appeared since last session). That cross-session reasoning is impossible with static rules.
+**Risk levels:**
+- `CRITICAL` — unauthenticated server with dangerous or write-scope tools
+- `HIGH` — unauthenticated server with read-only tools
+- `MEDIUM` — MCP server confirmed but auth rejected (credentials needed)
+- `LOW` — authenticated, tools enumerated
 
-Memory is stored in `~/.sentinel/memory/` by default. One file per target, keyed by a hash of the target string. Override with `--memory-dir`.
+---
+
+### `sentinel mcp scan` — MCP server security audit
+
+Enumerates all tools on a running MCP server and audits for authentication gaps, dangerous capabilities, injection surface, and exfiltration paths. Supports HTTP (streamable and SSE) and stdio transports.
+
+```bash
+sentinel mcp scan http://localhost:8000/sse
+sentinel mcp scan http://localhost:8000/sse --auth-header "Authorization: Bearer token"
+sentinel mcp scan --stdio "python my_server.py"
+sentinel mcp scan http://localhost:8000/sse --fail-on CRITICAL
+sentinel mcp scan http://localhost:8000/sse --format json
+```
+
+**Rules:**
+
+| Rule | Severity | What it catches |
+|------|----------|-----------------|
+| `NO_AUTH` | CRITICAL | Server accepts tool enumeration with no credentials |
+| `UNAUTH_DANGEROUS_EXEC` | CRITICAL | Dangerous tools callable without authentication |
+| `EXFILTRATION_PATH` | CRITICAL | Internal-read tools + external-write tools on the same server |
+| `CODE_EXECUTION_TOOL` | CRITICAL | Server exposes shell/exec/code execution tools |
+| `UNBOUNDED_INPUT` | HIGH | `command`, `path`, `query`, `url`, `code` parameters with no constraints |
+| `TOOL_SPRAWL` | MEDIUM | >10 tools across 5+ distinct categories |
+| `VAGUE_TOOL_DESCRIPTIONS` | MEDIUM | Tools with fewer than 3 words in their description |
 
 ---
 
 ### `sentinel supply-chain` — MCP tool manifest audit
 
-Audits an MCP server's tool manifest for supply chain compromise: description injection, name/capability mismatch, hidden network fields, schema anomalies, and registry drift against a baseline.
+Audits an MCP server's tool manifest for supply chain compromise: description injection, name/capability mismatch, hidden network fields, schema gaps, and registry drift against a saved baseline.
 
-Covers **ASI04** (Agentic Supply Chain Compromise) from OWASP Top 10 for Agentic Applications 2026.
+Covers **ASI04** (Agentic Supply Chain Compromise).
 
 ```bash
-# Static rules only (no API key needed)
-sentinel supply-chain http://localhost:3001
+# Static rules
+sentinel supply-chain http://localhost:8000/sse
 sentinel supply-chain --stdio "python my_server.py"
 
-# + Claude semantic analysis (catches creative deception static rules miss)
-sentinel supply-chain http://localhost:3001 --ai
+# + Claude semantic analysis (catches subtle deception static rules miss)
+sentinel supply-chain http://localhost:8000/sse --ai
 
-# Baseline workflow — detect changes over time
-sentinel supply-chain http://localhost:3001 --save-baseline ./baseline.json
-sentinel supply-chain http://localhost:3001 --baseline ./baseline.json
+# Baseline drift — detect changes over time
+sentinel supply-chain http://localhost:8000/sse --save-baseline ./baseline.json
+sentinel supply-chain http://localhost:8000/sse --baseline ./baseline.json
 
 # CI gate
-sentinel supply-chain http://localhost:3001 --fail-on CRITICAL
+sentinel supply-chain http://localhost:8000/sse --fail-on CRITICAL
 ```
 
-**Static rules (no API key):**
+**Rules:**
 
 | Rule | Severity | What it catches |
 |------|----------|-----------------|
-| `SC01_DESCRIPTION_INJECTION` | CRITICAL | LLM-targeting phrases in tool descriptions (`"ignore previous"`, `"from now on"`, etc.) |
-| `SC02_NAME_CAPABILITY_MISMATCH` | HIGH | Read-only name (`get_`, `fetch_`, `list_`) with write/dangerous capability |
+| `SC01_DESCRIPTION_INJECTION` | CRITICAL | LLM-targeting phrases in tool descriptions |
+| `SC06_REGISTRY_DRIFT` | CRITICAL | Tools added, removed, or schema/description changed vs. baseline |
+| `SC02_NAME_CAPABILITY_MISMATCH` | HIGH | Read-only name (`get_`, `list_`) with write/dangerous capability |
 | `SC03_HIDDEN_NETWORK_FIELDS` | HIGH | Schema accepts `url`, `webhook`, `endpoint` not disclosed in description |
-| `SC04_SCHEMA_MISSING_ON_WRITE` | HIGH | Write/dangerous tool with no input schema — accepts anything |
-| `SC05_DECEPTIVE_BENIGN_NAME` | MEDIUM | `help`, `summarize`, `format` masking code execution |
-| `SC06_REGISTRY_DRIFT` | CRITICAL | Tools added, removed, or changed vs. saved baseline |
+| `SC04_SCHEMA_MISSING_ON_WRITE` | HIGH | Write/dangerous tool with no input schema |
+| `SC05_DECEPTIVE_BENIGN_NAME` | MEDIUM | `help`, `summarize`, `format` masking dangerous capability |
 
 ---
 
 ### `sentinel scan` — static posture audit
 
-AST analysis of Python agent files. Detects exfiltration paths, dangerous grants, hardcoded credentials, and privilege excess. No API key required.
+AST analysis of Python agent source files. Detects exfiltration paths, dangerous grants, hardcoded credentials, and privilege excess. No API key required. Zero extra dependencies.
 
 ```bash
 sentinel scan my_agent.py
 sentinel scan ./agents/
-sentinel scan my_agent.py --fail-on CRITICAL    # CI gate
-sentinel scan my_agent.py --format json
-sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT  # suppress known-accepted finding
+sentinel scan ./agents/ --fail-on CRITICAL
+sentinel scan ./agents/ --format json
+sentinel scan ./agents/ --ignore-rule DANGEROUS_GRANTS  # suppress accepted finding
 ```
+
+**Detects tools defined via:**
+- `@tool` decorator · `BaseTool` / `StructuredTool` subclasses
+- `StructuredTool.from_function(name=...)` · `Tool(name=...)`
+- `bind_tools([...])` · `create_react_agent(llm, tools)` · `create_agent(llm, tools)`
+- `AgentExecutor(tools=[...])` · direct Anthropic/OpenAI API `messages.create(tools=[...])`
 
 **Rules:**
 
@@ -165,10 +203,9 @@ sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT  # suppr
 | `PROMPT_INJECTION_VECTOR` | HIGH | Web-read + write grants |
 | `LATERAL_MOVEMENT_PATH` | HIGH | Admin/IAM + infrastructure grants |
 | `PRIVILEGE_EXCESS` | HIGH | Write grants on a read-only described agent |
-| `DANGEROUS_GRANTS` | HIGH | Dangerous tool grants present |
+| `DANGEROUS_GRANTS` | HIGH | Dangerous grants outside code execution category |
 | `TOOL_SPRAWL` | MEDIUM | >10 tools across 5+ categories |
 | `UNDESCRIBED_WRITE_AGENT` | MEDIUM | Write grants, no description |
-| `MISSING_RATE_LIMIT` | LOW | Dangerous grants without rate limiting |
 
 ---
 
@@ -185,149 +222,85 @@ sentinel secrets . --fail-on HIGH          # CI gate
 sentinel secrets . --format json
 ```
 
-Detects: Anthropic, OpenAI, AWS, GitHub, Stripe, Google, HuggingFace keys · email, credit card (Luhn-validated), US SSN · Singapore NRIC/FIN (mod-11 checksum), passport, mobile, UEN · memory contamination (PII clusters from tool call results, system prompt leakage).
+**Detects:**
 
----
-
-### `sentinel mcp scan` — MCP server security audit
-
-Enumerates all tools on an MCP server and audits for authentication gaps, dangerous capabilities, and injection surface. Works on HTTP and stdio transports.
-
-```bash
-sentinel mcp scan http://localhost:3001
-sentinel mcp scan --stdio "python my_server.py"
-sentinel mcp scan http://localhost:3001 --auth-header "Authorization: Bearer token"
-sentinel mcp scan http://localhost:3001 --fail-on CRITICAL
-```
-
-**Rules:** `NO_AUTH` · `UNAUTH_DANGEROUS_EXEC` · `EXFILTRATION_PATH` · `CODE_EXECUTION_TOOL` · `UNBOUNDED_INPUT` · `TOOL_SPRAWL` · `VAGUE_TOOL_DESCRIPTIONS` · `MISSING_RATE_LIMIT`
-
----
-
-### `sentinel probe` — static red-team battery
-
-Fires attack payloads against any HTTP agent endpoint. No API key required. Good for CI gates.
-
-```bash
-sentinel probe http://localhost:3000
-sentinel probe http://localhost:3000 --attacks injection,jailbreak
-sentinel probe http://localhost:3000 --fail-on HIGH
-```
-
-Categories: `injection` · `jailbreak` · `extraction` · `encoding` · `context`
-
----
-
-### `sentinel ai-probe` — Claude autonomous red-team
-
-Claude Opus acts as an autonomous security researcher. Forms its own threat model, crafts targeted attacks, escalates on partial success, documents findings with OWASP mappings.
-
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-sentinel ai-probe http://localhost:3000
-sentinel ai-probe http://localhost:3000 --context "customer service bot for a bank"
-sentinel ai-probe http://localhost:3000 --max-probes 30
-```
+- Credentials: Anthropic, OpenAI, AWS, GitHub, Stripe, Google, HuggingFace API keys · private keys · database URLs · JWT tokens
+- PII (global): email addresses · credit cards (Luhn-validated) · US SSN · US phone
+- PII (Singapore): NRIC/FIN (mod-11 checksum-validated) · passport · mobile · landline · UEN · postal code
+- Memory contamination: email + NRIC/SSN clusters from tool call results · system prompt leakage in memory files
 
 ---
 
 ### `sentinel inspect` — agent intelligence report
 
-Fingerprints an agent's framework, model, deployment, and data flows. With `ANTHROPIC_API_KEY` set, generates a plain English description.
+Fingerprints an agent file or live HTTP endpoint: framework, model, role (MCP server vs. MCP client vs. agent), system prompt, environment variables.
 
 ```bash
-sentinel inspect my_agent.py
-sentinel inspect http://localhost:3000
-sentinel inspect ./agents/ --no-ai
+sentinel inspect my_agent.py --no-ai
+sentinel inspect mcp_server.py --no-ai
+sentinel inspect http://localhost:8000
+sentinel inspect ./agents/
 ```
 
----
+Correctly distinguishes:
+- **MCP Server** — `mcp.server.*` imports (tool provider, no LLM)
+- **MCP Client** — `mcp.client.*` imports (agent connecting to an MCP server)
+- **AI Agent** — standalone LLM agent
 
-### `sentinel discover` — find AI agents in your environment
-
-Scans running processes, network ports, Docker containers, and source directories for AI agents — including unmonitored ones.
-
-```bash
-sentinel discover
-sentinel discover --docker
-sentinel discover --subnet 10.0.0.0/24
-sentinel discover --path ./agents/
-sentinel discover --format json
-```
+With `ANTHROPIC_API_KEY` set, generates a plain English security summary.
 
 ---
 
 ### `sentinel a2a` — multi-agent trust analysis
 
-Scans Python agent source files and builds a call graph showing which agents call which, then audits the trust boundaries between them. Detects the attack paths that single-agent tools miss entirely: injection that propagates across agent boundaries, unbounded agent spawning, and code-execution agents that accept delegated instructions without verification.
+Builds a call graph from Python agent source and audits trust boundaries. Detects injection propagation across agent boundaries, unbounded spawning, and code-execution agents accepting unverified delegations.
 
-Supports **LangChain / LangGraph**, **AutoGen**, and **CrewAI**. No API key required.
+Supports **LangChain / LangGraph**, **AutoGen**, **CrewAI**, and **MCP client → server connections**.
 
 ```bash
 sentinel a2a ./agents/
 sentinel a2a multi_agent.py
 sentinel a2a . --fail-on HIGH
 sentinel a2a . --format json
-sentinel a2a . --ignore-rule A2A01_UNVERIFIED_ORCHESTRATOR  # suppress if handled at infra layer
 ```
+
+**Detected patterns:**
+- LangGraph `StateGraph.add_node` / `add_edge` / `add_conditional_edges`
+- AutoGen `initiate_chat`, `GroupChat`, `GroupChatManager`
+- CrewAI `Crew(agents=[...], process=Process.hierarchical)`
+- MCP client connections: `sse_client(url)`, `streamablehttp_client(url)` — surfaces agent → MCP server edges with URL resolution from constants
 
 **Rules:**
 
 | Rule | Severity | What it catches |
 |------|----------|-----------------|
-| `A2A03_IMPLICIT_TRUST` | CRITICAL | Code-execution agent accepts calls from other agents with no caller verification |
+| `A2A03_IMPLICIT_TRUST` | CRITICAL | Code-execution agent accepts calls from other agents with no verification |
 | `A2A04_PROMPT_PASSTHROUGH` | HIGH | User input flows directly across an agent boundary without sanitization |
-| `A2A02_UNBOUNDED_SPAWNING` | HIGH | Agent is instantiated inside a loop — unbounded agent creation risk |
+| `A2A02_UNBOUNDED_SPAWNING` | HIGH | Agent instantiated inside a loop — unbounded creation risk |
 | `A2A06_CIRCULAR_DELEGATION` | HIGH | Cycle in the call graph — agents can loop indefinitely under injection |
-| `A2A05_UNSCOPED_DELEGATION` | MEDIUM | Orchestrator delegates its full tool set to a sub-agent instead of a restricted subset |
-| `A2A01_UNVERIFIED_ORCHESTRATOR` | LOW | Agents receive instructions from other agents with no visible trust verification |
+| `A2A05_UNSCOPED_DELEGATION` | MEDIUM | Orchestrator delegates full tool set instead of a restricted subset |
 
-**Example output:**
-
-```
-  2 agents  1 edges  1 max depth  acyclic
-
-  Agent         Framework   Role          Tools
-  planner       autogen     worker        —
-  executor      autogen     orchestrator  —    ⚠ code exec
-
-  Call graph:
-    executor ──► planner  initiate_chat  passes input
-
-  ● HIGH      A2A04_PROMPT_PASSTHROUGH  ASI01
-              User input flows directly from 'executor' to 'planner'
-              without sanitization at the agent boundary.
-
-  Trust Score   75/100  ███████████████░░░░░  WATCH
-```
-
-Covers **ASI07** (Insecure Inter-Agent Communication) from OWASP Top 10 for Agentic Applications 2026.
+Covers **ASI07** (Insecure Inter-Agent Communication).
 
 ---
 
 ## Finding suppression
 
-Use `--ignore-rule` to suppress specific findings by rule ID. Suppressed findings are excluded from `--fail-on` evaluation and output — they don't break CI gates.
+Use `--ignore-rule` to suppress findings by rule ID. Suppressed findings are excluded from `--fail-on` evaluation — they don't break CI gates.
 
 ```bash
-# Suppress a single finding for one run
-sentinel scan ./agents/ --fail-on HIGH --ignore-rule MISSING_RATE_LIMIT
-
-# Stack multiple suppressions
-sentinel mcp scan http://localhost:3001 --fail-on CRITICAL \
+sentinel scan ./agents/ --fail-on HIGH --ignore-rule DANGEROUS_GRANTS
+sentinel mcp scan http://localhost:8000/sse --fail-on CRITICAL \
   --ignore-rule NO_AUTH \
   --ignore-rule UNBOUNDED_INPUT
 ```
 
-For project-level suppressions, create a **`.sentinelignore`** file in your project root. sentinel walks up from the target directory to find it — the same discovery pattern as `.gitignore`.
+For project-level suppressions, create a **`.sentinelignore`** file in your project root. `sentinel` walks up from the target to find it — same discovery pattern as `.gitignore`.
 
 ```
 # .sentinelignore
-# Comments start with #
-
-MISSING_RATE_LIMIT          # rate limiting enforced at API gateway
-SC03_HIDDEN_NETWORK_FIELDS  # webhook field verified safe — used for audit logging
 NO_AUTH                     # server is behind an authenticated reverse proxy
+SC03_HIDDEN_NETWORK_FIELDS  # webhook field verified safe — used for audit logging
 ```
 
 Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel secrets`, `sentinel inspect`.
@@ -338,16 +311,15 @@ Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel su
 
 | OWASP Risk | ID | sentinel coverage |
 |------------|-----|------------------|
-| Agent Goal Hijack | ASI01 | `sentinel probe`, `sentinel ai-probe` (direct injection); `sentinel agentic` (indirect/semantic) |
-| Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan`, `sentinel agentic` |
-| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel agentic` |
-| **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI), **`sentinel agentic`** |
-| Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` |
-| **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination), **`sentinel agentic`** |
-| **Insecure Inter-Agent Communication** | **ASI07** | **`sentinel a2a`** (call graph + trust rules), `sentinel agentic` (semantic reasoning) |
-| Cascading Agent Failures | ASI08 | `sentinel agentic` (cross-finding chain analysis) |
-| Human-Agent Trust Exploitation | ASI09 | `sentinel agentic` (narrative + evidence standard) |
-| Rogue Agents | ASI10 | `sentinel agentic` (drift detection across sessions) |
+| Agent Goal Hijack | ASI01 | `sentinel scan` (PROMPT_INJECTION_VECTOR), `sentinel supply-chain` (SC01) |
+| Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan` |
+| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS) |
+| **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI semantic analysis) |
+| Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` (CODE_EXECUTION_TOOL) |
+| **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination, system prompt leakage) |
+| **Insecure Inter-Agent Communication** | **ASI07** | **`sentinel a2a`** (call graph + trust rules) |
+| Cascading Agent Failures | ASI08 | `sentinel discover` (surface unmonitored agents) |
+| Rogue Agents | ASI10 | `sentinel discover` (find agents that shouldn't exist) |
 
 ---
 
@@ -374,44 +346,29 @@ jobs:
         run: sentinel secrets . --fail-on HIGH
 
       - name: MCP supply chain audit
-        run: sentinel supply-chain http://localhost:3001 --fail-on CRITICAL
+        run: sentinel supply-chain http://localhost:8000/sse --fail-on CRITICAL
 
       - name: MCP security audit
-        run: sentinel mcp scan http://localhost:3001 --fail-on CRITICAL
+        run: sentinel mcp scan http://localhost:8000/sse --fail-on CRITICAL
 
       - name: Multi-agent trust analysis
         run: sentinel a2a ./agents/ --fail-on HIGH
 ```
 
-Use a `.sentinelignore` file at the repo root to suppress known-accepted findings without weakening the gate threshold:
+Use `.sentinelignore` at the repo root to suppress accepted risks without weakening the gate:
 
 ```
 # .sentinelignore — committed to source control
-MISSING_RATE_LIMIT    # rate limiting handled at infra layer
+NO_AUTH    # server is behind an authenticated reverse proxy
 ```
-
----
-
-## When to use analyst mode vs. static mode
-
-| Situation | Use |
-|-----------|-----|
-| CI/CD gate on every PR | Static rules (`--fail-on CRITICAL`) |
-| Adopting CI gates incrementally | Static rules + `.sentinelignore` to suppress accepted risks |
-| Investigating a specific server or codebase | `sentinel agentic` |
-| First assessment of a new MCP server | `sentinel agentic` |
-| Scheduled nightly security check | `sentinel agentic` (memory tracks drift) |
-| Auditing a multi-agent codebase | `sentinel a2a` (call graph + trust rules) |
-| Quick local sanity check | `sentinel mcp scan`, `sentinel scan` |
-| Red-teaming a live agent endpoint | `sentinel ai-probe` |
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- `ANTHROPIC_API_KEY` required for: `sentinel agentic`, `sentinel ai-probe`, `sentinel supply-chain --ai`, `sentinel inspect` (AI summary)
-- No API key required for: `sentinel scan`, `sentinel a2a`, `sentinel secrets`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel probe`, `sentinel discover`, `sentinel inspect --no-ai`
+- No API key required for: `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`, `sentinel a2a`
+- `ANTHROPIC_API_KEY` required for: `sentinel supply-chain --ai`, `sentinel inspect` (AI summary)
 
 ---
 

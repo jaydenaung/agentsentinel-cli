@@ -55,14 +55,19 @@ def print_inspect_result(report: InspectReport) -> None:
     console.print()
     fp = report.fingerprint
 
-    type_label = (
-        "[bold yellow]MCP Server[/bold yellow] (tool provider — use sentinel mcp scan for full audit)"
-        if fp.server_type == "mcp_server"
-        else "[bold white]AI Agent[/bold white] (tool consumer with LLM)"
-    )
+    if fp.server_type == "mcp_server":
+        type_label = "[bold yellow]MCP Server[/bold yellow] (tool provider — use sentinel mcp scan for full audit)"
+        model_fallback = "[dim]n/a — MCP servers have no LLM[/dim]"
+    elif fp.server_type == "mcp_client":
+        type_label = "[bold cyan]MCP Client[/bold cyan] (agent that connects to an MCP server for tools)"
+        model_fallback = "[dim]not detected[/dim]"
+    else:
+        type_label = "[bold white]AI Agent[/bold white] (standalone LLM agent)"
+        model_fallback = "[dim]not detected[/dim]"
+
     _fp_row("Type",          type_label)
-    _fp_row("Framework",     fp.framework if fp.framework != "unknown" else "[dim]unknown[/dim]")
-    _fp_row("Model",         fp.model or ("[dim]n/a — MCP servers have no LLM[/dim]" if fp.server_type == "mcp_server" else "[dim]not detected[/dim]"))
+    _fp_row("Framework",     fp.framework if fp.framework not in ("unknown", "") else "[dim]unknown[/dim]")
+    _fp_row("Model",         fp.model or model_fallback)
     _fp_row("Python",        fp.python_version or "[dim]not detected[/dim]")
     _fp_row("Deployment",    fp.deployment if fp.deployment != "local" else "[dim]local[/dim]")
     _fp_row("Cloud",         fp.cloud if fp.cloud != "unknown" else "[dim]on-prem / unknown[/dim]")

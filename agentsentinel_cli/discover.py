@@ -1,12 +1,11 @@
 """
-sentinel discover — finds AI agents across processes, network, files, and Docker containers.
+sentinel discover — find MCP servers and AI agent processes.
 
 Scan vectors:
-  process   running Python/Node processes making LLM API calls
-  network   open ports serving MCP SSE endpoints or agent APIs
-  subnet    CIDR subnet scan — finds agents across an internal network
-  files     Python source files in a directory containing agent patterns
-  docker    Docker containers with LLM API keys in their environment
+  process   running Python/Node processes serving MCP or calling LLM APIs
+  network   open ports on localhost confirmed as MCP via protocol handshake
+  subnet    CIDR subnet — TCP sweep then MCP handshake on every open port
+  docker    Docker containers with MCP server or LLM agent patterns
 """
 
 from __future__ import annotations
@@ -34,17 +33,19 @@ from agentsentinel_cli.frameworks import (
 
 @dataclasses.dataclass
 class DiscoveredAgent:
-    source: str            # process | network | subnet | file | docker
+    source: str            # process | network | subnet | docker
     name: str              # human-readable name
-    framework: str         # LangChain | OpenAI Agents SDK | MCP | etc.
+    framework: str         # FastMCP | LangChain | AutoGen | etc.
     provider: str          # Anthropic | OpenAI | Google | etc.
     model: str             # claude-sonnet | gpt-4o | etc.  (empty if unknown)
-    location: str          # pid:1234 | 10.0.1.45:8080 | /path/file.py | container:name
+    location: str          # pid:1234 | 10.0.1.45:8080 | container:name
     api_keys: list[str]    # masked keys: ANTHROPIC_API_KEY=sk-ant-...5f3d
     live_connections: list[str]   # LLM API hosts this process is talking to
     risk: str              # CRITICAL | HIGH | MEDIUM | LOW | UNKNOWN
     risk_reason: str       # one-line explanation of the risk level
     next_step: str         # suggested follow-up command
+    tools: list[str] = dataclasses.field(default_factory=list)   # tool names (MCP enumeration)
+    transport: str = ""    # "http" | "sse" | "" (empty for non-MCP)
 
 
 @dataclasses.dataclass
@@ -67,10 +68,6 @@ _DEFAULT_PORTS = [
     9000, 9001,
     11434,                   # Ollama
 ]
-
-_MCP_INDICATOR_PATHS   = ["/sse", "/messages/"]
-_OPENAI_COMPAT_PATHS   = ["/v1/models"]
-_SENTINEL_PATHS        = ["/api/v1/agents", "/health"]
 
 # Subnet scan limits — scanning beyond these sizes is impractical
 _MAX_SUBNET_HOSTS_WARN  = 1024    # /22 — warn but allow
@@ -221,8 +218,9 @@ def scan_network(
     host: str = "127.0.0.1",
     ports: list[int] | None = None,
     timeout: float = 0.5,
+    extra_headers: dict[str, str] | None = None,
 ) -> list[DiscoveredAgent]:
-    """Probe a single host's ports for AI agent endpoints."""
+    """Probe a single host's ports — confirms MCP via protocol handshake."""
     if ports is None:
         ports = _DEFAULT_PORTS
 
@@ -230,11 +228,20 @@ def scan_network(
     if not open_ports:
         return []
 
+    # SSE handshake needs much more time than a TCP connect — use a fixed floor
+    # of 8 seconds regardless of the port-sweep timeout.
+    handshake_timeout = max(timeout * 16, 8.0)
+
     found: list[DiscoveredAgent] = []
-    for port in open_ports:
-        agent = _probe_port(host, port, timeout * 4)
-        if agent:
-            found.append(agent)
+    with ThreadPoolExecutor(max_workers=min(10, len(open_ports))) as pool:
+        futures = {
+            pool.submit(_probe_mcp, host, port, handshake_timeout, extra_headers): port
+            for port in open_ports
+        }
+        for future in as_completed(futures):
+            agent = future.result()
+            if agent:
+                found.append(agent)
     return found
 
 
@@ -273,19 +280,24 @@ def scan_subnet(
     cidr: str,
     ports: list[int] | None = None,
     timeout: float = 0.3,
-    on_progress: Optional[Callable[[int, int, str], None]] = None,
+    extra_headers: dict[str, str] | None = None,
+    on_progress: Optional[Callable[[int, int, str, str], None]] = None,
 ) -> tuple[list[DiscoveredAgent], SubnetScanStats]:
-    """Scan every host in a CIDR subnet for AI agent endpoints.
+    """Scan every host in a CIDR subnet for MCP servers.
 
-    Uses a two-phase approach:
-      Phase 1 — parallel TCP connect across all host:port combinations (fast)
-      Phase 2 — HTTP probe on every open port to identify agent type (targeted)
+    Two phases:
+      Phase 1 — parallel TCP connect across all host:port pairs (fast sweep)
+      Phase 2 — MCP protocol handshake on every open port (targeted verification)
+
+    A result in Phase 2 means the MCP initialize exchange completed — not just
+    that a port was open.
 
     Args:
-        cidr:        Network range, e.g. "10.0.0.0/24"
-        ports:       Port list to probe (default: _DEFAULT_PORTS)
-        timeout:     Per-connection TCP timeout in seconds
-        on_progress: Optional callback(completed, total, current_ip) for progress display
+        cidr:         Network range, e.g. "10.0.0.0/24"
+        ports:        Port list to probe (default: _DEFAULT_PORTS)
+        timeout:      Per-connection TCP timeout in seconds
+        extra_headers: HTTP headers for MCP handshake (auth tokens, etc.)
+        on_progress:  Optional callback(completed, total, current_ip, phase)
 
     Returns:
         (agents, stats) tuple
@@ -302,7 +314,7 @@ def scan_subnet(
     if len(hosts) > _MAX_SUBNET_HOSTS_BLOCK:
         raise ValueError(
             f"{cidr} contains {len(hosts):,} hosts. "
-            f"Maximum supported is {_MAX_SUBNET_HOSTS_BLOCK:,} (/{32 - _MAX_SUBNET_HOSTS_BLOCK.bit_length() + 1}). "
+            f"Maximum supported is {_MAX_SUBNET_HOSTS_BLOCK:,}. "
             "Use a smaller subnet or scan individual host ranges."
         )
 
@@ -310,8 +322,7 @@ def scan_subnet(
     total_probes = len(hosts) * len(ports)
     open_targets: list[tuple[str, int]] = []
 
-    # ── Phase 1: parallel TCP connect across all host:port pairs ─────────────
-    # High concurrency — most connections refuse immediately, failures are cheap.
+    # ── Phase 1: parallel TCP connect ────────────────────────────────────────
     completed = 0
     workers = min(250, total_probes)
 
@@ -323,25 +334,36 @@ def scan_subnet(
             return None
 
     tasks = [(h, p) for h in hosts for p in ports]
-    futures = {}
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(check_port, h, p): (h, p) for h, p in tasks}
-        for future in as_completed(futures):
+        futures_p1 = {pool.submit(check_port, h, p): (h, p) for h, p in tasks}
+        for future in as_completed(futures_p1):
             result = future.result()
             if result:
                 open_targets.append(result)
             completed += 1
             if on_progress:
-                host_ip, _ = futures[future]
-                on_progress(completed, total_probes, host_ip)
+                host_ip, _ = futures_p1[future]
+                on_progress(completed, total_probes, host_ip, "1")
 
-    # ── Phase 2: HTTP probe on open ports to identify agent type ─────────────
+    # ── Phase 2: MCP protocol handshake on open ports ─────────────────────
     found: list[DiscoveredAgent] = []
-    for host_ip, port in open_targets:
-        agent = _probe_port(host_ip, port, timeout * 8)
-        if agent:
-            found.append(agent)
+    if open_targets:
+        p2_workers = min(20, len(open_targets))
+        with ThreadPoolExecutor(max_workers=p2_workers) as pool:
+            futures_p2 = {
+                pool.submit(_probe_mcp, h, p, timeout * 10, extra_headers): (h, p)
+                for h, p in open_targets
+            }
+            p2_done = 0
+            for future in as_completed(futures_p2):
+                agent = future.result()
+                if agent:
+                    found.append(agent)
+                p2_done += 1
+                if on_progress:
+                    h, p = futures_p2[future]
+                    on_progress(p2_done, len(open_targets), f"{h}:{p}", "2")
 
     elapsed = time.monotonic() - started_at
     stats = SubnetScanStats(
@@ -355,199 +377,119 @@ def scan_subnet(
     return found, stats
 
 
-# ── Port prober ───────────────────────────────────────────────────────────────
+# ── MCP protocol prober ───────────────────────────────────────────────────────
 
-def _probe_port(host: str, port: int, timeout: float) -> DiscoveredAgent | None:
-    """Make HTTP requests to an open port and detect what kind of agent it is."""
+def _auth_is_enforced(base: str, timeout: float) -> bool:
+    """Return True only if the server actively rejects unauthenticated requests.
+
+    Probes without credentials. McpAuthRequired (401/403) → enforced.
+    Successful handshake → not enforced (server accepts anyone).
+    Any other error → assume not enforced (conservative — don't hide risk).
+    """
+    from agentsentinel_cli.mcp_client import scan_http, McpAuthRequired, McpError
     try:
-        import httpx
-    except ImportError:
-        return None
+        scan_http(base, extra_headers=None, timeout=timeout)
+        return False
+    except McpAuthRequired:
+        return True
+    except (McpError, Exception):
+        return False
+
+
+def _probe_mcp(
+    host: str,
+    port: int,
+    timeout: float,
+    extra_headers: dict[str, str] | None = None,
+) -> DiscoveredAgent | None:
+    """Confirm a port is an MCP server by completing the initialize handshake.
+
+    Tries streamable-HTTP (POST) first; falls back to SSE (GET /sse) automatically.
+    A non-None return means the MCP protocol exchange succeeded or the server
+    explicitly rejected us with 401/403 — both confirm an MCP server is present.
+    """
+    from agentsentinel_cli.mcp_client import scan_http, McpAuthRequired, McpError
 
     base = f"http://{host}:{port}"
     location = f"{host}:{port}"
 
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-
-        # MCP SSE server
-        for path in _MCP_INDICATOR_PATHS:
-            try:
-                r = client.get(f"{base}{path}", headers={"Accept": "text/event-stream"})
-                if r.status_code < 500 and (
-                    "text/event-stream" in r.headers.get("content-type", "")
-                    or "event-stream" in r.text[:200]
-                    or r.status_code == 200
-                ):
-                    return DiscoveredAgent(
-                        source="network",
-                        name=f"mcp-server@{location}",
-                        framework="MCP Server",
-                        provider="",
-                        model="",
-                        location=location,
-                        api_keys=[],
-                        live_connections=[],
-                        risk="HIGH",
-                        risk_reason="MCP server with no authentication detected — inspect tools",
-                        next_step=f"sentinel mcp scan {base}/sse",
-                    )
-            except httpx.RequestError:
-                pass
-
-        # OpenAI-compatible API (Ollama, LiteLLM, vLLM, etc.)
-        for path in _OPENAI_COMPAT_PATHS:
-            try:
-                r = client.get(f"{base}{path}")
-                if r.status_code in (200, 401) and _looks_like_openai_api(r):
-                    model = _extract_model_from_response(r)
-                    auth_required = r.status_code == 401
-                    return DiscoveredAgent(
-                        source="network",
-                        name=f"llm-api@{location}",
-                        framework="OpenAI-compatible API",
-                        provider="",
-                        model=model,
-                        location=location,
-                        api_keys=[],
-                        live_connections=[],
-                        risk="LOW" if auth_required else "MEDIUM",
-                        risk_reason=(
-                            "OpenAI-compatible API (auth required)"
-                            if auth_required
-                            else "OpenAI-compatible API with no authentication — open access"
-                        ),
-                        next_step=f"sentinel scan --url {base}",
-                    )
-            except httpx.RequestError:
-                pass
-
-        # AgentSentinel platform
-        try:
-            r = client.get(f"{base}/health")
-            if r.status_code == 200 and r.text.strip().startswith("{"):
-                body = r.json()
-                if "status" in body:
-                    return DiscoveredAgent(
-                        source="network",
-                        name=f"agentsentinel@{location}",
-                        framework="AgentSentinel",
-                        provider="",
-                        model="",
-                        location=location,
-                        api_keys=[],
-                        live_connections=[],
-                        risk="LOW",
-                        risk_reason="AgentSentinel monitoring platform",
-                        next_step=f"sentinel scan --connect http://{location}",
-                    )
-        except (httpx.RequestError, Exception):
-            pass
-
-        # Generic agent API (LangChain server, FastAPI agent, etc.)
-        try:
-            r = client.get(f"{base}/api/v1/agents")
-            if r.status_code in (200, 401, 403):
-                auth_required = r.status_code in (401, 403)
-                return DiscoveredAgent(
-                    source="network",
-                    name=f"agent-api@{location}",
-                    framework="Unknown Agent API",
-                    provider="",
-                    model="",
-                    location=location,
-                    api_keys=[],
-                    live_connections=[],
-                    risk="MEDIUM" if not auth_required else "LOW",
-                    risk_reason=(
-                        "Agent API endpoint detected (auth required)"
-                        if auth_required
-                        else "Agent API endpoint with no authentication"
-                    ),
-                    next_step=f"sentinel scan --url {base}",
-                )
-        except httpx.RequestError:
-            pass
-
-    return None
-
-
-def _looks_like_openai_api(response) -> bool:
     try:
-        body = response.json()
-        return "data" in body or "models" in body or "object" in body or "error" in body
-    except Exception:
-        return False
-
-
-def _extract_model_from_response(response) -> str:
-    try:
-        data = response.json().get("data", [])
-        if data:
-            return data[0].get("id", "")
-    except Exception:
-        pass
-    return ""
-
-
-# ── File scanner ──────────────────────────────────────────────────────────────
-
-def scan_files(path: Path) -> list[DiscoveredAgent]:
-    """Find Python files in a directory that look like AI agents."""
-    from agentsentinel_cli.scanner import scan_path as static_scan
-
-    agents = static_scan(path)
-    found: list[DiscoveredAgent] = []
-
-    for agent in agents:
-        framework, provider = detect_framework(agent.file.read_text(errors="ignore"))
-        model = agent.model or detect_model(agent.file.read_text(errors="ignore"))
-        tool_count = len(agent.tools)
-        has_dangerous = any(t.is_dangerous for t in agent.tools)
-        has_creds = bool(agent.hardcoded_creds)
-
-        risk, risk_reason = _assess_file_risk(has_creds, has_dangerous, tool_count, framework)
-
-        found.append(DiscoveredAgent(
-            source="file",
-            name=agent.file.stem.replace("_", "-"),
-            framework=framework if framework != "Unknown" else _infer_framework_from_tools(agent),
-            provider=provider,
-            model=model,
-            location=str(agent.file),
-            api_keys=[f"HARDCODED: {c}" for c in agent.hardcoded_creds],
+        server = scan_http(base, extra_headers=extra_headers, timeout=timeout)
+    except McpAuthRequired:
+        # Server is MCP — it understood our handshake but requires credentials
+        scan_url = f"{base}/sse" if True else base  # SSE is dominant transport
+        return DiscoveredAgent(
+            source="network",
+            name=f"mcp-server@{location}",
+            framework="MCP Server",
+            provider="",
+            model="",
+            location=location,
+            api_keys=[],
             live_connections=[],
-            risk=risk,
-            risk_reason=risk_reason,
-            next_step=f"sentinel scan {agent.file}",
-        ))
+            risk="MEDIUM",
+            risk_reason="MCP server confirmed — authentication required, tools not enumerated",
+            next_step=(
+                f"sentinel mcp scan {base}/sse --auth-header 'Authorization: Bearer <token>'"
+            ),
+            tools=[],
+            transport="",
+        )
+    except McpError:
+        return None
+    except Exception:
+        return None
 
-    return found
+    # Handshake succeeded — assess risk based on actual tool content and whether
+    # the server actually enforces authentication.
+    tool_names = [t.name for t in server.tools]
+    has_dangerous = any(t.is_dangerous for t in server.tools)
+    has_write = any(t.scope == "write" for t in server.tools)
 
+    # When credentials were provided, verify the server actually requires them.
+    # If it accepts a probe WITHOUT credentials too, auth is not enforced — the
+    # server is still open to anyone and the risk doesn't change.
+    auth_enforced = False
+    if extra_headers:
+        auth_enforced = _auth_is_enforced(base, timeout)
 
-def _infer_framework_from_tools(agent) -> str:
-    sources = {t.source for t in agent.tools}
-    if "BaseTool subclass" in sources or "StructuredTool" in str(sources):
-        return "LangChain"
-    if "@tool decorator" in sources:
-        return "LangChain / CrewAI"
-    return "Python agent"
+    if not extra_headers or not auth_enforced:
+        if has_dangerous or has_write:
+            risk = "CRITICAL"
+            bad = ", ".join(t.name for t in server.tools if t.is_dangerous or t.scope == "write")
+            risk_reason = f"Unauthenticated MCP server with dangerous/write tools: {bad}"
+        else:
+            n = len(server.tools)
+            risk = "HIGH"
+            risk_reason = (
+                f"Unauthenticated MCP server — {n} tool{'s' if n != 1 else ''} publicly accessible"
+            )
+    else:
+        n = len(server.tools)
+        risk = "LOW"
+        risk_reason = f"MCP server (auth enforced) — {n} tool{'s' if n != 1 else ''} enumerated"
 
+    scan_url = f"{base}/sse" if server.transport == "sse" else base
+    auth_flag = (
+        f" --auth-header '{next(iter(extra_headers.items()))[0]}: ...'"
+        if extra_headers else ""
+    )
 
-def _assess_file_risk(
-    has_creds: bool,
-    has_dangerous: bool,
-    tool_count: int,
-    framework: str,
-) -> tuple[str, str]:
-    if has_creds:
-        return "CRITICAL", "Hardcoded credentials detected in source code — rotate immediately"
-    if has_dangerous:
-        return "HIGH", "Agent holds dangerous tool grants — run full scan"
-    if tool_count > 10:
-        return "MEDIUM", f"{tool_count} tool grants — excessive permissions, high blast radius"
-    if tool_count > 0:
-        return "LOW", f"{tool_count} tool grant{'s' if tool_count != 1 else ''} detected"
-    return "UNKNOWN", "Agent file detected — run full scan for analysis"
+    return DiscoveredAgent(
+        source="network",
+        name=server.name if server.name != "unknown" else f"mcp-server@{location}",
+        framework=f"MCP Server ({server.transport.upper()})",
+        provider="",
+        model="",
+        location=location,
+        api_keys=[],
+        live_connections=[],
+        risk=risk,
+        risk_reason=risk_reason,
+        next_step=f"sentinel mcp scan {scan_url}{auth_flag}",
+        tools=tool_names,
+        transport=server.transport,
+    )
 
 
 # ── Docker scanner ────────────────────────────────────────────────────────────
@@ -651,10 +593,10 @@ def run_discovery(
     do_process: bool = True,
     do_network: bool = True,
     do_docker: bool = False,
-    scan_path: Optional[Path] = None,
     ports: list[int] | None = None,
     subnet: Optional[str] = None,
-    subnet_progress_cb: Optional[Callable[[int, int, str], None]] = None,
+    extra_headers: dict[str, str] | None = None,
+    subnet_progress_cb: Optional[Callable[[int, int, str, str], None]] = None,
 ) -> tuple[list[DiscoveredAgent], Optional[SubnetScanStats]]:
     """Run all requested discovery scanners.
 
@@ -667,18 +609,16 @@ def run_discovery(
         results.extend(scan_processes())
 
     if do_network:
-        results.extend(scan_network(ports=ports))
+        results.extend(scan_network(ports=ports, extra_headers=extra_headers))
 
     if subnet:
         agents, subnet_stats = scan_subnet(
             cidr=subnet,
             ports=ports,
+            extra_headers=extra_headers,
             on_progress=subnet_progress_cb,
         )
         results.extend(agents)
-
-    if scan_path:
-        results.extend(scan_files(scan_path))
 
     if do_docker:
         results.extend(scan_docker())

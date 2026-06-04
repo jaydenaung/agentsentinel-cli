@@ -114,15 +114,26 @@ def _rule_code_execution(ctx: McpContext) -> McpFinding | None:
 
 
 def _rule_unbounded_input(ctx: McpContext) -> McpFinding | None:
-    """HIGH: unconstrained string inputs increase injection payload surface. (OWASP LLM01)"""
+    """HIGH: dangerous string parameters have no input constraints. (OWASP LLM01)
+
+    Only flags parameters whose names suggest they feed dangerous operations —
+    shell commands, SQL queries, file paths, URLs, code. Generic string fields
+    (name, title, message, body) are not flagged.
+    """
+    _DANGEROUS_PARAMS = frozenset({
+        "command", "cmd", "shell", "shell_command",
+        "query", "sql", "sql_query", "expression",
+        "path", "file_path", "filepath", "filename", "directory", "dir",
+        "url", "uri", "endpoint", "webhook", "target",
+        "code", "script", "template", "prompt",
+    })
+
     unvalidated: list[str] = []
     for tool in ctx.server.tools:
-        schema = tool.input_schema
-        props = schema.get("properties", {})
-        if not props and schema.get("type") == "object":
-            unvalidated.append(f"{tool.name} (no schema)")
-            continue
+        props = tool.input_schema.get("properties", {})
         for prop_name, prop_def in props.items():
+            if prop_name.lower() not in _DANGEROUS_PARAMS:
+                continue
             if (
                 prop_def.get("type") == "string"
                 and "maxLength" not in prop_def
@@ -130,7 +141,6 @@ def _rule_unbounded_input(ctx: McpContext) -> McpFinding | None:
                 and "pattern" not in prop_def
             ):
                 unvalidated.append(f"{tool.name}.{prop_name}")
-                break
 
     if unvalidated:
         sample = unvalidated[:5]
@@ -139,24 +149,29 @@ def _rule_unbounded_input(ctx: McpContext) -> McpFinding | None:
             severity="HIGH",
             rule_id="UNBOUNDED_INPUT",
             message=(
-                "Tools accept unconstrained string inputs with no maxLength, enum, or pattern. "
-                "Injection payloads can be passed directly through tool arguments."
+                "Dangerous parameters (command, path, query, url, code) accept unconstrained "
+                "string input. No maxLength, enum, or pattern — injection payloads pass through directly."
             ),
-            detail=f"Unconstrained inputs: {', '.join(sample)}{suffix}",
+            detail=f"Unconstrained dangerous inputs: {', '.join(sample)}{suffix}",
         )
     return None
 
 
 def _rule_tool_sprawl(ctx: McpContext) -> McpFinding | None:
-    """MEDIUM: excessive tool count increases blast radius. (OWASP LLM06)"""
+    """MEDIUM: high tool count across many categories increases blast radius. (OWASP LLM06)
+
+    Requires BOTH high count AND diverse categories. A server with 14 file-system
+    tools is a focused file manager. A server with 12 tools spanning code execution,
+    email, database, and web is a broad attack surface.
+    """
     categories = {t.category for t in ctx.server.tools} - {"other"}
-    if len(ctx.server.tools) > 10 or len(categories) >= 5:
+    if len(ctx.server.tools) > 10 and len(categories) >= 5:
         return McpFinding(
             severity="MEDIUM",
             rule_id="TOOL_SPRAWL",
             message=(
-                f"Server exposes {len(ctx.server.tools)} tools across {len(categories)} categories. "
-                "Every tool is an attack surface — reduce to the minimum required."
+                f"Server exposes {len(ctx.server.tools)} tools across {len(categories)} "
+                "distinct categories. High cross-category diversity increases blast radius."
             ),
             detail=f"Categories: {', '.join(sorted(categories))}",
         )
@@ -164,33 +179,25 @@ def _rule_tool_sprawl(ctx: McpContext) -> McpFinding | None:
 
 
 def _rule_vague_descriptions(ctx: McpContext) -> McpFinding | None:
-    """MEDIUM: thin tool descriptions expand prompt injection surface. (OWASP LLM01)"""
-    vague = [t.name for t in ctx.server.tools if len(t.description.strip()) < 20]
+    """MEDIUM: missing or single-word tool descriptions expand prompt injection surface. (OWASP LLM01)
+
+    Flags descriptions with fewer than 3 words — empty, one-word, or two-word
+    descriptions give the LLM no context about what the tool does or what it
+    should NOT do.
+    """
+    vague = [
+        t.name for t in ctx.server.tools
+        if len(t.description.strip().split()) < 3
+    ]
     if len(vague) >= 2:
         return McpFinding(
             severity="MEDIUM",
             rule_id="VAGUE_TOOL_DESCRIPTIONS",
             message=(
-                "Multiple tools have short or missing descriptions. "
-                "Vague descriptions make it easier for prompt injection to misdirect tool use."
+                "Multiple tools have absent or near-absent descriptions (fewer than 3 words). "
+                "Without clear descriptions the LLM cannot reason about safe tool use."
             ),
-            detail=f"Thin descriptions on: {', '.join(vague[:5])}{'…' if len(vague) > 5 else ''}",
-        )
-    return None
-
-
-def _rule_missing_rate_limit(ctx: McpContext) -> McpFinding | None:
-    """LOW: MCP protocol has no built-in rate limiting. (OWASP LLM06)"""
-    dangerous = [t.name for t in ctx.server.tools if t.is_dangerous]
-    if dangerous:
-        return McpFinding(
-            severity="LOW",
-            rule_id="MISSING_RATE_LIMIT",
-            message=(
-                "Dangerous tools detected. MCP has no built-in rate limiting — "
-                "ensure the server layer enforces per-client call limits."
-            ),
-            detail=f"Verify limits on: {', '.join(dangerous)}",
+            detail=f"Absent descriptions: {', '.join(vague[:5])}{'…' if len(vague) > 5 else ''}",
         )
     return None
 
@@ -206,8 +213,6 @@ _ALL_RULES = [
     # MEDIUM
     _rule_tool_sprawl,
     _rule_vague_descriptions,
-    # LOW
-    _rule_missing_rate_limit,
 ]
 
 _SEVERITY_WEIGHT = {"CRITICAL": 40, "HIGH": 20, "MEDIUM": 10, "LOW": 5}

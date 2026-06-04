@@ -145,27 +145,32 @@ def _rule_privilege_excess(agent: AgentInfo) -> Finding | None:
 
 
 def _rule_dangerous_grants(agent: AgentInfo) -> Finding | None:
-    dangerous = [t.name for t in agent.tools if t.is_dangerous]
+    # Exclude code_execution tools — CODE_EXECUTION_GRANT already covers them at CRITICAL.
+    # This rule catches dangerous tools outside that category (e.g. send_email, delete_record).
+    dangerous = [
+        t.name for t in agent.tools
+        if t.is_dangerous and t.category not in _CODE_EXEC_CATEGORIES
+    ]
     if dangerous:
         return Finding(
             severity="HIGH",
             rule_id="DANGEROUS_GRANTS",
-            message="Agent holds dangerous tool grants. Verify intent and add rate limits.",
+            message="Agent holds dangerous tool grants outside code execution. Verify intent.",
             detail=f"Dangerous tools: {', '.join(dangerous)}",
         )
     return None
 
 
 def _rule_tool_sprawl(agent: AgentInfo) -> Finding | None:
-    """MEDIUM: agent holds too many tools across too many categories — blast radius scales with sprawl."""
+    """MEDIUM: high tool count across many categories — blast radius scales with diversity."""
     categories = {t.category for t in agent.tools if t.category != "other"}
-    if len(agent.tools) > 10 or len(categories) >= 5:
+    if len(agent.tools) > 10 and len(categories) >= 5:
         return Finding(
             severity="MEDIUM",
             rule_id="TOOL_SPRAWL",
             message=(
                 f"Agent holds {len(agent.tools)} tools across {len(categories)} categories. "
-                "Reduce grants to the minimum required for each task."
+                "High cross-category diversity increases blast radius."
             ),
             detail=f"Categories present: {', '.join(sorted(categories))}",
         )
@@ -187,19 +192,6 @@ def _rule_write_without_description(agent: AgentInfo) -> Finding | None:
     return None
 
 
-def _rule_missing_rate_limit(agent: AgentInfo) -> Finding | None:
-    """Flag dangerous tools — rate limits aren't visible in static analysis."""
-    dangerous = [t.name for t in agent.tools if t.is_dangerous]
-    if dangerous:
-        return Finding(
-            severity="LOW",
-            rule_id="MISSING_RATE_LIMIT",
-            message="Dangerous grants detected. Ensure rate limits are configured at runtime.",
-            detail=f"Tools to check: {', '.join(dangerous)}",
-        )
-    return None
-
-
 _ALL_RULES = [
     # CRITICAL
     _rule_exfiltration_path,
@@ -215,8 +207,6 @@ _ALL_RULES = [
     # MEDIUM
     _rule_tool_sprawl,
     _rule_write_without_description,
-    # LOW
-    _rule_missing_rate_limit,
 ]
 
 _SEVERITY_WEIGHT = {"CRITICAL": 40, "HIGH": 20, "MEDIUM": 10, "LOW": 5}

@@ -19,13 +19,18 @@ class AgentFingerprint:
     system_prompt_snippet: str = ""
     env_vars: list[str] = dataclasses.field(default_factory=list)
     external_apis: list[str] = dataclasses.field(default_factory=list)
-    server_type: str = "agent"   # "agent" | "mcp_server"
+    server_type: str = "agent"   # "agent" | "mcp_server" | "mcp_client"
 
 
-# MCP server SDK imports — presence means this is a tool provider, not an agent
+# Only server-side SDK modules — bare "mcp" and "mcp.types" are shared; "mcp.client.*" is a consumer
 _MCP_SERVER_IMPORTS = frozenset({
-    "mcp", "mcp.server", "mcp.server.fastmcp", "mcp.types",
-    "modelcontextprotocol", "fastmcp",
+    "mcp.server", "mcp.server.fastmcp", "fastmcp",
+})
+
+# Client-side SDK modules — this file consumes tools from an MCP server
+_MCP_CLIENT_IMPORTS = frozenset({
+    "mcp.client", "mcp.client.sse", "mcp.client.stdio",
+    "mcp.client.streamable_http", "mcp.client.websocket",
 })
 
 # Ordered by specificity — first match wins
@@ -127,11 +132,22 @@ class _FingerprintVisitor(ast.NodeVisitor):
                 if val and any(val.startswith(p) for p in _KNOWN_MODELS):
                     self.model = val
 
-        # os.environ.get("KEY") / os.getenv("KEY")
-        if func_name in ("get", "getenv") and node.args:
+        # os.getenv("KEY") — direct function call
+        if func_name == "getenv" and node.args:
             val = _get_str(node.args[0])
             if val and val not in self.env_vars:
                 self.env_vars.append(val)
+
+        # os.environ.get("KEY") — attribute chain: must be <name>.environ.get(...)
+        if func_name == "get" and node.args:
+            if (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Attribute)
+                and node.func.value.attr == "environ"
+            ):
+                val = _get_str(node.args[0])
+                if val and val not in self.env_vars:
+                    self.env_vars.append(val)
 
         self.generic_visit(node)
 
@@ -210,15 +226,29 @@ def fingerprint_file(path: Path) -> AgentFingerprint:
 
     cloud, deployment = _detect_cloud(v.imports, v.has_lambda_handler)
 
-    # Determine whether this is an MCP server (tool provider) or an AI agent (tool consumer)
-    is_mcp_server = any(
-        any(imp == mcp_imp or imp.startswith(mcp_imp + ".") for imp in v.imports)
-        for mcp_imp in _MCP_SERVER_IMPORTS
-    )
-    server_type = "mcp_server" if is_mcp_server else "agent"
+    def _matches(imp: str, prefix: str) -> bool:
+        return imp == prefix or imp.startswith(prefix + ".")
 
-    # MCP servers expose their framework label differently
-    framework = "MCP Server (FastMCP)" if is_mcp_server else _detect_framework(v.imports)
+    is_mcp_server = any(
+        any(_matches(imp, p) for imp in v.imports) for p in _MCP_SERVER_IMPORTS
+    )
+    is_mcp_client = any(
+        any(_matches(imp, p) for imp in v.imports) for p in _MCP_CLIENT_IMPORTS
+    )
+
+    # A file with mcp.server.* is a tool provider; mcp.client.* is a tool consumer.
+    # If both appear the file is unusual (proxy/relay) — treat as server since it
+    # exposes tools.  Client-only → mcp_client, neither → agent.
+    if is_mcp_server:
+        server_type = "mcp_server"
+        has_fastmcp = any(_matches(imp, "mcp.server.fastmcp") or _matches(imp, "fastmcp") for imp in v.imports)
+        framework = "FastMCP" if has_fastmcp else "MCP Server"
+    elif is_mcp_client:
+        server_type = "mcp_client"
+        framework = _detect_framework(v.imports)
+    else:
+        server_type = "agent"
+        framework = _detect_framework(v.imports)
 
     return AgentFingerprint(
         framework=framework,

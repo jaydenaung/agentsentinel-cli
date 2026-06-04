@@ -34,11 +34,12 @@ _SOURCE_LABEL = {
 }
 
 
-def print_subnet_progress(completed: int, total: int, current_ip: str) -> None:
+def print_subnet_progress(completed: int, total: int, current_ip: str, phase: str = "1") -> None:
     """Inline progress updater for subnet scan — overwrites the same line."""
     pct = int(completed / total * 100) if total else 0
+    label = "TCP sweep" if phase == "1" else "MCP handshake"
     console.print(
-        f"\r  [dim]Scanning {current_ip} … {pct}% ({completed}/{total})[/dim]",
+        f"\r  [dim]Phase {phase} {label}: {current_ip} … {pct}% ({completed}/{total})[/dim]",
         end="",
         highlight=False,
     )
@@ -71,7 +72,7 @@ def print_discover_result(
                 f"{subnet_stats.elapsed_seconds:.1f}s[/dim]"
             )
         console.print()
-        console.print("  [dim]Tip: use [bold]--path ./your/code[/bold] to scan source files, "
+        console.print("  [dim]Tip: use [bold]--subnet 10.0.0.0/24[/bold] to scan a network range, "
                       "or [bold]--docker[/bold] to inspect containers.[/dim]")
         console.print()
         return
@@ -136,6 +137,13 @@ def _print_agent(agent: DiscoveredAgent, verbose: bool) -> None:
         hosts = ", ".join(sorted(set(agent.live_connections)))
         console.print(f"  {'':>10}[dim]Live connections:[/dim] {hosts}")
 
+    # Enumerated tools (MCP network findings only)
+    if agent.tools:
+        tools_str = ", ".join(agent.tools[:8])
+        if len(agent.tools) > 8:
+            tools_str += f" (+{len(agent.tools) - 8} more)"
+        console.print(f"  {'':>10}[dim]Tools:[/dim] [cyan]{tools_str}[/cyan]")
+
     # Risk reason
     console.print(f"  {'':>10}[dim]{agent.risk_reason}[/dim]")
 
@@ -190,8 +198,8 @@ def _print_summary(
     if critical or high:
         console.print()
         console.print(
-            "  [dim]Run [bold]sentinel scan <file or --pid or --url>[/bold] "
-            "for a full posture analysis on any agent above.[/dim]"
+            "  [dim]Run [bold]sentinel mcp scan <url>[/bold] "
+            "for a full tool-by-tool security audit on any MCP server above.[/dim]"
         )
 
     if subnet_stats:

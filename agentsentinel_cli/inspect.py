@@ -82,7 +82,7 @@ def _template_summary(
 ) -> str:
     """Generate a plain English summary without Claude — used as fallback."""
     if fingerprint.server_type == "mcp_server":
-        fw = fingerprint.framework if fingerprint.framework != "unknown" else "MCP server"
+        fw = fingerprint.framework if fingerprint.framework not in ("unknown", "") else "MCP server"
         parts: list[str] = [f"This is a {fw} — a tool provider with no LLM of its own."]
         parts.append("It exposes tools for AI agents to call.")
         if tools:
@@ -90,7 +90,16 @@ def _template_summary(
         parts.append("Run sentinel mcp scan against the live endpoint for a full security audit.")
         return " ".join(parts)
 
-    fw = fingerprint.framework if fingerprint.framework != "unknown" else "AI agent"
+    if fingerprint.server_type == "mcp_client":
+        fw = fingerprint.framework if fingerprint.framework not in ("unknown", "") else "agent"
+        model_str = f" using {fingerprint.model}" if fingerprint.model else ""
+        parts = [f"This is a {fw} MCP client{model_str}."]
+        parts.append("It connects to an external MCP server over the network to access tools.")
+        if fingerprint.system_prompt_found:
+            parts.append("A system prompt is configured for the LLM.")
+        return " ".join(parts)
+
+    fw = fingerprint.framework if fingerprint.framework not in ("unknown", "") else "AI agent"
     model_str = f" using {fingerprint.model}" if fingerprint.model else ""
 
     parts = []

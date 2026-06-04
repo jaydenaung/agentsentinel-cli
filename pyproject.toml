@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentsentinel-cli"
-version = "0.7.0"
-description = "Agentic security CLI — AI analyst with memory, supply chain audit, MCP audit, red-team probing, and agent discovery"
+version = "0.8.3"
+description = "AI agent and MCP server security scanner — discovery, static analysis, supply chain audit, and multi-agent trust analysis"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
@@ -32,35 +32,12 @@ discover = [
     "psutil>=5.9.0",    # process scanning
     "httpx>=0.24.0",    # network probing
 ]
-# sentinel scan --connect (live behavior data from platform)
-connect = [
-    "httpx>=0.24.0",
-]
-# sentinel mcp scan (MCP server auditing)
+# sentinel mcp scan, supply-chain, inspect (HTTP transport)
 mcp = [
-    "httpx>=0.24.0",    # HTTP/streamable-HTTP transport
-]
-# sentinel probe (static attack battery)
-probe = [
     "httpx>=0.24.0",
 ]
-# sentinel ai-probe (Claude-driven red-team agent)
-ai-probe = [
-    "httpx>=0.24.0",
-    "anthropic>=0.50.0",
-]
-# sentinel inspect (agent intelligence report — AI summary optional)
-inspect = [
-    "httpx>=0.24.0",
-    "anthropic>=0.50.0",
-]
-# sentinel supply-chain (MCP tool manifest supply chain audit — AI analysis optional)
-supply-chain = [
-    "httpx>=0.24.0",
-    "anthropic>=0.50.0",
-]
-# sentinel agentic (Claude analyst with persistent memory — full agentic security mode)
-agentic = [
+# sentinel supply-chain --ai, sentinel inspect (AI summary)
+ai = [
     "httpx>=0.24.0",
     "anthropic>=0.50.0",
 ]

@@ -51,7 +51,6 @@ def print_scan_result(
     findings_map: dict[Path, list[Finding]],
     scores_map: dict[Path, int],
     target: Path,
-    connect_url: str | None = None,
 ) -> None:
     total_findings = sum(len(f) for f in findings_map.values())
     total_critical = sum(1 for fl in findings_map.values() for f in fl if f.severity == "CRITICAL")
@@ -143,13 +142,6 @@ def print_scan_result(
         summary_parts.append(f"[bold orange1]{total_high} HIGH[/bold orange1]")
     console.print("  " + " · ".join(summary_parts))
 
-    if connect_url:
-        console.print(f"\n  [dim]Connected to AgentSentinel at {connect_url} — open dashboard for live behavior data.[/dim]")
-    else:
-        console.print(
-            "\n  [dim]This is a static scan. Run with [bold]--connect[/bold] to include live behavior "
-            "monitoring data from a running AgentSentinel instance.[/dim]"
-        )
     console.print()
 
 
