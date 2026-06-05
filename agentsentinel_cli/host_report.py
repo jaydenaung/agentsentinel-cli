@@ -61,7 +61,7 @@ def print_host_result(ctx: HostContext, findings: list[HostFinding], score: int)
     console.print()
     console.print(Panel.fit(
         "[bold white]AgentSentinel — Host AI Security Posture[/bold white]\n"
-        "[dim]Local AI tools · macOS privacy permissions · system security[/dim]",
+        "[dim]AI tools · privacy permissions · system security[/dim]",
         border_style="bright_blue",
         padding=(0, 2),
     ))
@@ -94,12 +94,22 @@ def print_host_result(ctx: HostContext, findings: list[HostFinding], score: int)
     else:
         console.print("  [dim]Claude Desktop config not found[/dim]")
 
-    # MCP servers table
+    if ctx.vendor_configs:
+        console.print()
+        for vc in ctx.vendor_configs:
+            console.print(
+                f"  [bold white]{vc.display_name}[/bold white]  [dim]{vc.path}[/dim]\n"
+                f"  [dim]  {len(vc.mcp_servers)} MCP server(s)[/dim]"
+            )
+
+    # MCP servers table — all sources combined
     all_servers = []
     if ctx.claude_code:
         all_servers.extend((s, "Claude Code") for s in ctx.claude_code.mcp_servers)
     if ctx.claude_desktop:
         all_servers.extend((s, "Desktop") for s in ctx.claude_desktop.mcp_servers)
+    for vc in ctx.vendor_configs:
+        all_servers.extend((s, vc.display_name) for s in vc.mcp_servers)
 
     if all_servers:
         console.print()
@@ -224,6 +234,14 @@ def as_host_json(ctx: HostContext, findings: list[HostFinding], score: int) -> s
                 "filesystem_paths": s.filesystem_paths,
                 "env_keys": s.env_keys,
             })
+    for vc in ctx.vendor_configs:
+        for s in vc.mcp_servers:
+            all_mcp.append({
+                "name": s.name, "source": vc.vendor,
+                "has_network_access": s.has_network_access,
+                "filesystem_paths": s.filesystem_paths,
+                "env_keys": s.env_keys,
+            })
 
     return json.dumps({
         "scan_type": "host",
@@ -236,6 +254,11 @@ def as_host_json(ctx: HostContext, findings: list[HostFinding], score: int) -> s
         "claude_desktop": {
             "found": ctx.claude_desktop is not None,
         },
+        "vendor_tools": [
+            {"vendor": vc.vendor, "display_name": vc.display_name,
+             "mcp_server_count": len(vc.mcp_servers)}
+            for vc in ctx.vendor_configs
+        ],
         "mcp_servers": all_mcp,
         "memory": {
             "file_count": ctx.memory_file_count,

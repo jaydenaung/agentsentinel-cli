@@ -65,6 +65,8 @@ def _all_mcp_servers(ctx: HostContext) -> list[McpServerConfig]:
         servers.extend(ctx.claude_code.mcp_servers)
     if ctx.claude_desktop:
         servers.extend(ctx.claude_desktop.mcp_servers)
+    for vc in ctx.vendor_configs:
+        servers.extend(vc.mcp_servers)
     return servers
 
 
@@ -375,7 +377,7 @@ def _rule_sensitive_path(ctx: HostContext) -> HostFinding | None:
 
 
 def _rule_many_mcp_servers(ctx: HostContext) -> HostFinding | None:
-    """MEDIUM: large number of MCP servers configured expands the attack surface."""
+    """MEDIUM: large number of MCP servers across all AI tools expands the attack surface."""
     seen: set[str] = set()
     unique = []
     for s in _all_mcp_servers(ctx):
@@ -385,18 +387,25 @@ def _rule_many_mcp_servers(ctx: HostContext) -> HostFinding | None:
     if len(unique) < 8:
         return None
     names = ", ".join(s.name for s in unique[:6])
+    tools: list[str] = []
+    if ctx.claude_code:
+        tools.append("Claude Code")
+    if ctx.claude_desktop:
+        tools.append("Claude Desktop")
+    tools.extend(vc.display_name for vc in ctx.vendor_configs)
+    tool_str = ", ".join(tools) if tools else "your AI tools"
     return HostFinding(
         severity="MEDIUM",
         rule_id="HOST_MANY_MCP_SERVERS",
         category="config",
         message=(
-            f"{len(unique)} MCP servers are configured. "
+            f"{len(unique)} MCP servers are configured across {tool_str}. "
             "Each server is an independent prompt injection entry point. "
             "The more servers installed, the larger the blast radius of a single compromise."
         ),
         detail=f"Servers: {names}{'…' if len(unique) > 6 else ''}",
         remediation=(
-            "Remove MCP servers you do not actively use. "
+            "Remove MCP servers you do not actively use across all AI tools. "
             "Review each server's capabilities and remove any that duplicate functionality."
         ),
     )

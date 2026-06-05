@@ -303,6 +303,7 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 **What it checks:**
 - **Claude Code** — `allowedTools` (Bash bypass), MCP server configs, shell hooks
 - **Claude Desktop** — MCP server configs
+- **Third-party AI tools** — Cursor (`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Continue.dev (`~/.continue/config.json`), Gemini CLI (`~/.gemini/settings.json`), VS Code (`mcp.servers` in `settings.json`) — all MCP server configs audited with the same rules
 - **Shell configs** — hardcoded AI API keys in `.zshrc`, `.bashrc`, `.zprofile`, etc.
 - **macOS TCC permissions** — Full Disk Access, Screen Recording, Accessibility granted to AI apps
 - **macOS system security** — SIP, FileVault, Gatekeeper status
@@ -325,7 +326,7 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 | `HOST_HOOKS_SHELL` | MEDIUM | config | Claude Code shell hooks that could interpolate AI output |
 | `HOST_MCP_BROAD_FS` | MEDIUM | config | MCP server configured with home-dir or root-level path |
 | `HOST_MCP_SENSITIVE_PATH` | MEDIUM | config | MCP server has access to `~/.ssh`, `~/.aws`, `~/.kube`, or Keychain |
-| `HOST_MANY_MCP_SERVERS` | MEDIUM | config | 8+ MCP servers installed — large prompt injection attack surface |
+| `HOST_MANY_MCP_SERVERS` | MEDIUM | config | 8+ MCP servers across all detected AI tools — large prompt injection attack surface |
 | `HOST_GATEKEEPER_OFF` | MEDIUM | system | Gatekeeper disabled — unsigned binaries run without warning |
 | `HOST_LARGE_MEMORY` | LOW | data_exposure | Claude Code memory files exceed 50 MB of accumulated conversation data |
 

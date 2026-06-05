@@ -7,6 +7,7 @@ No network calls — all checks are local and read-only.
 
 import dataclasses
 import json
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -38,6 +39,15 @@ class ClaudeDesktopConfig:
 
 
 @dataclasses.dataclass
+class VendorConfig:
+    """Configuration found for a third-party AI coding tool or agent runtime."""
+    vendor: str          # "cursor" | "windsurf" | "continue" | "gemini_cli" | "vscode"
+    display_name: str    # human-readable
+    path: Path
+    mcp_servers: list[McpServerConfig]
+
+
+@dataclasses.dataclass
 class TccPermission:
     app_name: str
     bundle_id: str
@@ -59,6 +69,7 @@ class HostContext:
     """Aggregated host AI security posture data — passed to every rule."""
     claude_code: ClaudeCodeSettings | None
     claude_desktop: ClaudeDesktopConfig | None
+    vendor_configs: list[VendorConfig]
     memory_file_count: int
     memory_total_bytes: int
     shell_key_findings: list[tuple[str, str, str]]   # (key_type, file_path, redacted_snippet)
@@ -389,6 +400,98 @@ def _scan_exposed_processes() -> list[ExposedProcess]:
     return exposed
 
 
+# ── Third-party AI tool configs ───────────────────────────────────────────────
+
+def _dig(data: object, keys: list[str]) -> object:
+    """Navigate a nested dict by key path; returns None if any key is absent."""
+    for k in keys:
+        if not isinstance(data, dict):
+            return None
+        data = data.get(k)  # type: ignore[union-attr]
+        if data is None:
+            return None
+    return data
+
+
+def _parse_vendor_mcp(raw: dict, key_path: list[str], list_format: bool) -> list[McpServerConfig]:
+    """Extract MCP server configs from a vendor settings file.
+
+    list_format=True handles Continue.dev's array format;
+    False handles the dict format used by Cursor, Windsurf, Gemini CLI, and VS Code.
+    """
+    data = _dig(raw, key_path)
+    if not data:
+        return []
+    if list_format and isinstance(data, list):
+        return [
+            _analyze_mcp_server(item.get("name", f"server_{i}"), item)
+            for i, item in enumerate(data)
+            if isinstance(item, dict)
+        ]
+    if not list_format and isinstance(data, dict):
+        return [_analyze_mcp_server(k, v) for k, v in data.items() if isinstance(v, dict)]
+    return []
+
+
+def _read_vendor_configs() -> list[VendorConfig]:
+    """Discover MCP server configs for Cursor, Windsurf, Continue.dev, Gemini CLI, and VS Code."""
+    home = Path.home()
+    appdata = Path(os.environ["APPDATA"]) if "APPDATA" in os.environ else None
+
+    # (vendor_id, display_name, candidate_paths, mcp_json_key_path, list_format)
+    # key_path navigates nested keys: ["mcp", "servers"] → raw["mcp"]["servers"]
+    # list_format: True = array of {name, command, args}, False = dict of {name: {command, args}}
+    specs: list[tuple[str, str, list[Path], list[str], bool]] = [
+        ("cursor", "Cursor", [
+            home / ".cursor" / "mcp.json",
+            home / "Library" / "Application Support" / "Cursor" / "User" / "settings.json",
+            home / ".config" / "Cursor" / "User" / "settings.json",
+            *([appdata / "Cursor" / "User" / "settings.json"] if appdata else []),
+        ], ["mcpServers"], False),
+
+        ("windsurf", "Windsurf", [
+            home / ".codeium" / "windsurf" / "mcp_config.json",
+            home / "Library" / "Application Support" / "Windsurf" / "User" / "settings.json",
+            home / ".config" / "Windsurf" / "User" / "settings.json",
+            *([appdata / "Windsurf" / "User" / "settings.json"] if appdata else []),
+        ], ["mcpServers"], False),
+
+        ("continue", "Continue.dev", [
+            home / ".continue" / "config.json",
+        ], ["mcpServers"], True),
+
+        ("gemini_cli", "Gemini CLI", [
+            home / ".gemini" / "settings.json",
+        ], ["mcpServers"], False),
+
+        ("vscode", "VS Code", [
+            home / "Library" / "Application Support" / "Code" / "User" / "settings.json",
+            home / ".config" / "Code" / "User" / "settings.json",
+            *([appdata / "Code" / "User" / "settings.json"] if appdata else []),
+        ], ["mcp", "servers"], False),
+    ]
+
+    configs: list[VendorConfig] = []
+    for vendor_id, display_name, candidate_paths, key_path, list_fmt in specs:
+        for path in candidate_paths:
+            if not path.exists():
+                continue
+            try:
+                raw = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+            servers = _parse_vendor_mcp(raw, key_path, list_fmt)
+            if servers:
+                configs.append(VendorConfig(
+                    vendor=vendor_id,
+                    display_name=display_name,
+                    path=path,
+                    mcp_servers=servers,
+                ))
+            break  # use first matching path per vendor
+    return configs
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def scan_host() -> HostContext:
@@ -397,6 +500,7 @@ def scan_host() -> HostContext:
 
     claude_code = _read_claude_code_settings()
     claude_desktop = _read_claude_desktop_config()
+    vendor_configs = _read_vendor_configs()
     mem_count, mem_bytes = _scan_memory_files()
     shell_keys = _scan_shell_configs()
     tcc_perms, tcc_err = _read_tcc_permissions()
@@ -406,6 +510,7 @@ def scan_host() -> HostContext:
     return HostContext(
         claude_code=claude_code,
         claude_desktop=claude_desktop,
+        vendor_configs=vendor_configs,
         memory_file_count=mem_count,
         memory_total_bytes=mem_bytes,
         shell_key_findings=shell_keys,
