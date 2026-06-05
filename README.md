@@ -25,7 +25,7 @@ pipx install agentsentinel-cli
 | `sentinel secrets` | Are credentials or PII exposed in these files? |
 | `sentinel inspect` | What framework, model, and role is this agent? |
 | `sentinel a2a` | Are multi-agent trust boundaries safe? |
-| `sentinel host-scan` | What is my local AI security posture? |
+| `sentinel host-scan` | What is my local AI security posture across all AI tools? |
 
 ---
 
@@ -291,7 +291,9 @@ Covers **ASI07** (Insecure Inter-Agent Communication).
 
 ### `sentinel host-scan` — local AI security posture audit
 
-Audits your machine's AI security posture without any network calls. Reads Claude Code and Claude Desktop configurations, shell credential files, macOS privacy permissions (TCC), system security settings, and running AI processes.
+Audits your machine's AI security posture without any network calls. Discovers and audits MCP server configurations across every major AI coding tool on the host — Claude Code, Claude Desktop, Cursor, Windsurf, Continue.dev, Gemini CLI, and VS Code — then checks shell credentials, macOS privacy permissions, system security settings, and running AI processes.
+
+Works on macOS, Linux, and Windows. No API key required.
 
 ```bash
 sentinel host-scan
@@ -301,9 +303,19 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 ```
 
 **What it checks:**
-- **Claude Code** — `allowedTools` (Bash bypass), MCP server configs, shell hooks
+
+*Anthropic tools*
+- **Claude Code** — `allowedTools` (shell bypass), MCP server configs, shell hooks
 - **Claude Desktop** — MCP server configs
-- **Third-party AI tools** — Cursor (`~/.cursor/mcp.json`), Windsurf (`~/.codeium/windsurf/mcp_config.json`), Continue.dev (`~/.continue/config.json`), Gemini CLI (`~/.gemini/settings.json`), VS Code (`mcp.servers` in `settings.json`) — all MCP server configs audited with the same rules
+
+*Third-party AI tools* — MCP server configs audited with the same exfiltration, broad-filesystem, sensitive-path, and sprawl rules as Claude tools
+- **Cursor** — `~/.cursor/mcp.json`
+- **Windsurf** — `~/.codeium/windsurf/mcp_config.json`
+- **Continue.dev** — `~/.continue/config.json`
+- **Gemini CLI** — `~/.gemini/settings.json`
+- **VS Code** — `mcp.servers` in `settings.json` (MCP support added in VS Code 1.99)
+
+*Host security*
 - **Shell configs** — hardcoded AI API keys in `.zshrc`, `.bashrc`, `.zprofile`, etc.
 - **macOS TCC permissions** — Full Disk Access, Screen Recording, Accessibility granted to AI apps
 - **macOS system security** — SIP, FileVault, Gatekeeper status
@@ -317,15 +329,15 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 | `HOST_SHELL_UNRESTRICTED` | CRITICAL | config | `Bash` in `allowedTools` — shell runs without confirmation prompt |
 | `HOST_SIP_DISABLED` | CRITICAL | system | macOS System Integrity Protection is off |
 | `HOST_API_KEY_IN_SHELL` | HIGH | data_exposure | AI API keys hardcoded in shell config files |
-| `HOST_MCP_EXFIL_PATH` | HIGH | config | MCP server has both filesystem access and network capability |
+| `HOST_MCP_EXFIL_PATH` | HIGH | config | Any AI tool's MCP server has both filesystem access and network capability |
 | `HOST_FDA_AI_APP` | HIGH | permissions | Full Disk Access granted to an AI app or its terminal |
 | `HOST_SCREEN_RECORDING_AI` | HIGH | permissions | Screen Recording permission granted to an AI app |
 | `HOST_AI_PROCESS_EXPOSED` | HIGH | network | AI-related process listening on a non-localhost interface |
 | `HOST_FILEVAULT_OFF` | HIGH | system | FileVault disk encryption is disabled |
 | `HOST_ACCESSIBILITY_AI` | MEDIUM | permissions | Accessibility permission granted to an AI app |
 | `HOST_HOOKS_SHELL` | MEDIUM | config | Claude Code shell hooks that could interpolate AI output |
-| `HOST_MCP_BROAD_FS` | MEDIUM | config | MCP server configured with home-dir or root-level path |
-| `HOST_MCP_SENSITIVE_PATH` | MEDIUM | config | MCP server has access to `~/.ssh`, `~/.aws`, `~/.kube`, or Keychain |
+| `HOST_MCP_BROAD_FS` | MEDIUM | config | Any AI tool's MCP server configured with home-dir or root-level path |
+| `HOST_MCP_SENSITIVE_PATH` | MEDIUM | config | Any AI tool's MCP server has access to `~/.ssh`, `~/.aws`, `~/.kube`, or Keychain |
 | `HOST_MANY_MCP_SERVERS` | MEDIUM | config | 8+ MCP servers across all detected AI tools — large prompt injection attack surface |
 | `HOST_GATEKEEPER_OFF` | MEDIUM | system | Gatekeeper disabled — unsigned binaries run without warning |
 | `HOST_LARGE_MEMORY` | LOW | data_exposure | Claude Code memory files exceed 50 MB of accumulated conversation data |
