@@ -58,3 +58,11 @@ Repository = "https://github.com/jaydenaung/agentsentinel-cli"
 
 [tool.hatch.build.targets.wheel]
 packages = ["agentsentinel_cli"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "publish.sh",
+    "tmp/",
+    ".env",
+    ".env.*",
+]

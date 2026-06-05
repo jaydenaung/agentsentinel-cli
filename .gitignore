@@ -27,6 +27,10 @@ htmlcov/
 .env
 .env.*
 
+# Publish scripts contain credentials — never commit
+publish.sh
+tmp/
+
 # Sentinel analyst memory (local state, not for commit)
 .sentinel/
 
