@@ -26,6 +26,7 @@ pipx install agentsentinel-cli
 | `sentinel inspect` | What framework, model, and role is this agent? |
 | `sentinel a2a` | Are multi-agent trust boundaries safe? |
 | `sentinel host-scan` | What is my local AI security posture across all AI tools? |
+| `sentinel redteam mcp` | Can I actively exploit this MCP server? |
 
 ---
 
@@ -53,6 +54,11 @@ sentinel secrets ~/.claude/projects/   # scan Claude Code memory
 # Local AI security posture — no network calls
 sentinel host-scan
 sentinel host-scan --fail-on HIGH
+
+# Active red-team — real attacks, confirmed exploitation
+sentinel redteam mcp full http://localhost:8000
+sentinel redteam mcp inject http://localhost:8000 --type traverse --type ssrf
+sentinel redteam mcp auth http://localhost:8000
 ```
 
 ---
@@ -348,6 +354,85 @@ No API key required. No network calls.
 
 ---
 
+### `sentinel redteam mcp` — active MCP server exploitation
+
+The active red-team module for MCP servers. Every finding is backed by confirmed evidence from the server's actual response — no heuristics, no noise. If a traversal finding says it read `/etc/passwd`, it read `/etc/passwd`.
+
+Requires `httpx`: `pip install "agentsentinel-cli[mcp]"`
+
+```bash
+# Full run — all 5 phases, unified report
+sentinel redteam mcp full http://localhost:8000
+sentinel redteam mcp full http://localhost:8000 --intensity high --format json
+
+# Targeted phases
+sentinel redteam mcp recon   http://localhost:8000          # enumerate attack surface
+sentinel redteam mcp auth    http://localhost:8000          # auth bypass (5 credential scenarios)
+sentinel redteam mcp inject  http://localhost:8000          # all injection techniques
+sentinel redteam mcp poison  http://localhost:8000          # tool description + result injection
+sentinel redteam mcp fuzz    http://localhost:8000          # schema and type boundary fuzzing
+
+# Surgical injection — pick your techniques
+sentinel redteam mcp inject http://localhost:8000 --type traverse
+sentinel redteam mcp inject http://localhost:8000 --type traverse --type ssrf
+sentinel redteam mcp inject http://localhost:8000 --type cmd --type sqli --intensity high
+
+# With auth
+sentinel redteam mcp full http://localhost:8000 \
+  --auth-header "Authorization: Bearer token"
+
+# stdio transport (local MCP servers)
+sentinel redteam mcp full --stdio "python my_mcp_server.py"
+
+# CI gate — fail if any CRITICAL confirmed
+sentinel redteam mcp full http://localhost:8000 --fail-on CRITICAL
+
+# Save report
+sentinel redteam mcp full http://localhost:8000 --output report.json
+```
+
+**Phases:**
+
+| Phase | Command | What it tests |
+|-------|---------|---------------|
+| 1 — Recon | `recon` | Tool inventory, resource listing, dangerous capability flags |
+| 2 — Auth Bypass | `auth` | 5 credential scenarios: no creds, empty bearer, garbage token, invalid JWT, JWT alg:none |
+| 3 — Injection | `inject` | Path traversal, SSRF, command injection, SQL injection — payload fired, pattern matched in response |
+| 4 — Poison | `poison` | Static: adversarial instructions in tool descriptions. Dynamic: LLM instruction injection via tool parameters |
+| 5 — Fuzz | `fuzz` | Stack traces, internal path disclosure, template injection eval, type confusion |
+
+**Injection techniques (`--type`):**
+
+| Technique | What it confirms |
+|-----------|-----------------|
+| `traverse` | Arbitrary file read via path traversal — evidence: `/etc/passwd` content, `.env` keys |
+| `ssrf` | Server-side request forgery — evidence: AWS IMDS tokens, Redis/SSH banners, cloud metadata |
+| `cmd` | OS command injection — evidence: `uid=0(root)` from `id`, `REDTEAM_CMD_CONFIRMED` sentinel |
+| `sqli` | SQL injection — evidence: DB error messages (`ORA-`, `You have an error in your SQL syntax`) |
+| `llm` | LLM instruction injection via tool result — evidence: sentinel string echoed in clean response |
+
+**Intensity levels (`--intensity`):**
+
+| Level | Payloads per technique | Use case |
+|-------|----------------------|----------|
+| `low` | 5 | Fast CI gate |
+| `medium` | 15 | Standard engagement (default) |
+| `high` | Full library (~20) | Thorough pentest |
+
+**Finding severities:**
+
+| Severity | Example |
+|----------|---------|
+| CRITICAL | Path traversal confirmed — `/etc/passwd` content in response |
+| HIGH | LLM instruction injection — sentinel reflected in clean tool result |
+| MEDIUM | Input reflected in error message (injection vector, lower confidence) |
+| LOW | Unexpected content returned on malformed input |
+| INFO | Auth enforced on handshake, tool inventory |
+
+Every finding includes a **MITRE ATLAS** ID and **OWASP ASI** ID. Use `--verbose` to see full request/response bodies.
+
+---
+
 ## Finding suppression
 
 Use `--ignore-rule` to suppress findings by rule ID. Suppressed findings are excluded from `--fail-on` evaluation — they don't break CI gates.
@@ -375,11 +460,11 @@ Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel su
 
 | OWASP Risk | ID | sentinel coverage |
 |------------|-----|------------------|
-| Agent Goal Hijack | ASI01 | `sentinel scan` (PROMPT_INJECTION_VECTOR), `sentinel supply-chain` (SC01) |
-| Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan` |
-| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED) |
-| **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI semantic analysis) |
-| Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` (CODE_EXECUTION_TOOL) |
+| Agent Goal Hijack | ASI01 | `sentinel scan` (PROMPT_INJECTION_VECTOR), `sentinel supply-chain` (SC01), **`sentinel redteam mcp poison`** (confirmed injection) |
+| Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan`, **`sentinel redteam mcp inject`** (confirmed exploitation) |
+| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED), **`sentinel redteam mcp auth`** (bypass confirmation) |
+| **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI semantic analysis), **`sentinel redteam mcp poison`** (static description scan) |
+| Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` (CODE_EXECUTION_TOOL), **`sentinel redteam mcp inject --type cmd`** |
 | **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination, system prompt leakage), `sentinel host-scan` (HOST_LARGE_MEMORY) |
 | **Insecure Inter-Agent Communication** | **ASI07** | **`sentinel a2a`** (call graph + trust rules) |
 | Cascading Agent Failures | ASI08 | `sentinel discover` (surface unmonitored agents) |
@@ -420,6 +505,9 @@ jobs:
 
       - name: Host AI security posture
         run: sentinel host-scan --fail-on HIGH
+
+      - name: MCP red-team (active exploitation check)
+        run: sentinel redteam mcp full http://localhost:8000 --fail-on CRITICAL
 ```
 
 Use `.sentinelignore` at the repo root to suppress accepted risks without weakening the gate:
@@ -434,7 +522,7 @@ NO_AUTH    # server is behind an authenticated reverse proxy
 ## Requirements
 
 - Python 3.10+
-- No API key required for: `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`, `sentinel a2a`, `sentinel host-scan`
+- No API key required for: `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`, `sentinel a2a`, `sentinel host-scan`, `sentinel redteam mcp`
 - `ANTHROPIC_API_KEY` required for: `sentinel supply-chain --ai`, `sentinel inspect` (AI summary)
 
 ---
