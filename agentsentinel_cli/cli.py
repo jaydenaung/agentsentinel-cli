@@ -977,3 +977,628 @@ def _warn_missing_deps(do_process: bool, do_network: bool) -> None:
                 "[dim yellow]  ⚠  httpx not installed — network probe disabled.[/dim yellow]\n"
                 "[dim]  Install with: pip install agentsentinel-cli\\[discover][/dim]\n"
             )
+
+
+# ── sentinel redteam ──────────────────────────────────────────────────────────
+
+@main.group(name="redteam")
+def redteam_group() -> None:
+    """Active red-team attacks against AI infrastructure.
+
+    \b
+    Sub-groups:
+      mcp   Red-team an MCP server
+    """
+
+
+@redteam_group.group(name="mcp")
+def redteam_mcp_group() -> None:
+    """Red-team an MCP server — active adversarial testing.
+
+    \b
+    Commands:
+      recon    Enumerate tools, resources, prompts, and fingerprint the server
+      auth     Test authentication bypass across multiple credential scenarios
+      inject   Active injection attacks (path traversal, SSRF, cmd, SQLi, LLM)
+      poison   MCP-native: tool description analysis + LLM result injection
+      fuzz     Schema boundary and type-confusion fuzzing
+      full     Run all modules in sequence and produce a unified report
+    """
+
+
+# ── Shared option helpers ─────────────────────────────────────────────────────
+
+def _add_mcp_common(cmd: click.BaseCommand) -> click.BaseCommand:
+    """Attach the shared connection + output flags used by every mcp subcommand."""
+    cmd = click.argument("target", required=False, metavar="URL")(cmd)
+    cmd = click.option(
+        "--stdio", "stdio_cmd", default=None, metavar="CMD",
+        help="Attack a stdio-transport server. Provide the launch command.",
+    )(cmd)
+    cmd = click.option(
+        "--auth-header", "auth_header", default=None, metavar="HEADER",
+        help="HTTP auth header, e.g. 'Authorization: Bearer token'.",
+    )(cmd)
+    cmd = click.option(
+        "--timeout", default=15.0, show_default=True, metavar="SECONDS",
+        help="Per-request timeout.",
+    )(cmd)
+    cmd = click.option(
+        "--format", "fmt", type=click.Choice(["text", "json"]), default="text",
+        help="Output format.",
+    )(cmd)
+    cmd = click.option(
+        "--output", "output_path", default=None, metavar="FILE",
+        help="Save JSON evidence bundle to FILE (always JSON regardless of --format).",
+    )(cmd)
+    cmd = click.option(
+        "--verbose", "-v", is_flag=True, default=False,
+        help="Include raw request/response pairs in output.",
+    )(cmd)
+    cmd = click.option(
+        "--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
+        default=None,
+        help="Exit with code 1 if findings at or above this severity exist.",
+    )(cmd)
+    return cmd
+
+
+def _parse_auth_header(auth_header: str | None) -> dict[str, str]:
+    if not auth_header:
+        return {}
+    if ":" not in auth_header:
+        console.print("[red]Error:[/red] --auth-header must be 'Header-Name: value' format.")
+        sys.exit(1)
+    key, _, val = auth_header.partition(":")
+    return {key.strip(): val.strip()}
+
+
+def _require_target(target: str | None, stdio_cmd: str | None) -> None:
+    if not target and not stdio_cmd:
+        console.print("[red]Error:[/red] provide a URL or --stdio CMD.")
+        console.print("  Example: [dim]sentinel redteam mcp recon http://localhost:3000[/dim]")
+        console.print("  Example: [dim]sentinel redteam mcp recon --stdio 'python server.py'[/dim]")
+        sys.exit(1)
+    if target and stdio_cmd:
+        console.print("[red]Error:[/red] URL and --stdio are mutually exclusive.")
+        sys.exit(1)
+
+
+def _check_exit(findings: list, fail_on: str | None) -> None:
+    if not fail_on:
+        return
+    rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+    threshold = rank.get(fail_on, 0)
+    if any(rank.get(f.severity, 0) >= threshold for f in findings):
+        sys.exit(1)
+
+
+def _save_output(output_path: str | None, result) -> None:
+    if not output_path:
+        return
+    from agentsentinel_cli.redteam.report import as_redteam_json
+    Path(output_path).write_text(as_redteam_json(result))
+    console.print(f"\n  [green]✓ Evidence bundle saved:[/green] {output_path}\n")
+
+
+# ── sentinel redteam mcp recon ────────────────────────────────────────────────
+
+@redteam_mcp_group.command("recon")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--stdio", "stdio_cmd", default=None, metavar="CMD",
+              help="Attack a stdio-transport server.")
+@click.option("--auth-header", "auth_header", default=None, metavar="HEADER",
+              help="HTTP auth header, e.g. 'Authorization: Bearer token'.")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_recon(
+    target: str | None, stdio_cmd: str | None, auth_header: str | None,
+    timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """Enumerate tools, resources, prompts — map the full attack surface.
+
+    No payloads are sent. Passive enumeration only.
+
+    \b
+    Examples:
+        sentinel redteam mcp recon http://localhost:3000
+        sentinel redteam mcp recon --stdio "python server.py"
+        sentinel redteam mcp recon http://localhost:3000 --format json
+    """
+    import time
+    from agentsentinel_cli.redteam.transport import RedTeamSession
+    from agentsentinel_cli.redteam.mcp_recon import run_recon
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+    from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
+
+    _require_target(target, stdio_cmd)
+    headers = _parse_auth_header(auth_header)
+    display = stdio_cmd or target
+
+    t0 = time.monotonic()
+    try:
+        with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
+                            extra_headers=headers, timeout=timeout) as session:
+            findings, _ = run_recon(session, verbose)
+            result = RedTeamResult(
+                target=display, server_name=session.server_info.name,
+                server_version=session.server_info.version,
+                transport=session.server_info.transport,
+                modules_run=["recon"], findings=findings,
+                tool_count=len(session.server_info.tools),
+                attack_count=0, duration_s=time.monotonic() - t0,
+            )
+    except McpAuthRequired as exc:
+        console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+        console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
+        sys.exit(1)
+    except McpError as exc:
+        console.print(f"\n[red]Connection failed:[/red] {exc}")
+        sys.exit(1)
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(findings, fail_on)
+
+
+# ── sentinel redteam mcp auth ─────────────────────────────────────────────────
+
+@redteam_mcp_group.command("auth")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--stdio", "stdio_cmd", default=None, metavar="CMD")
+@click.option("--auth-header", "auth_header", default=None, metavar="HEADER",
+              help="Original valid credentials (used to enumerate tools before bypass attempts).")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_auth(
+    target: str | None, stdio_cmd: str | None, auth_header: str | None,
+    timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """Test authentication bypass — calls every tool with invalid credentials.
+
+    Tests: no credentials, empty bearer, garbage token, JWT alg:none, expired token.
+    A CRITICAL finding means a tool executed without valid auth.
+
+    \b
+    Examples:
+        sentinel redteam mcp auth http://localhost:3000
+        sentinel redteam mcp auth http://localhost:3000 --auth-header "Authorization: Bearer token"
+        sentinel redteam mcp auth http://localhost:3000 --verbose
+    """
+    import time
+    from agentsentinel_cli.redteam.mcp_auth import run_auth_bypass
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+    from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
+
+    _require_target(target, stdio_cmd)
+    headers = _parse_auth_header(auth_header)
+    display = stdio_cmd or target
+
+    t0 = time.monotonic()
+
+    # We need tool count — do a quick connect with valid credentials
+    tool_count = 0
+    try:
+        from agentsentinel_cli.redteam.transport import RedTeamSession
+        with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
+                            extra_headers=headers, timeout=timeout) as s:
+            tool_count = len(s.server_info.tools)
+            server_name = s.server_info.name
+            server_version = s.server_info.version
+            transport = s.server_info.transport
+    except (McpAuthRequired, McpError) as exc:
+        server_name, server_version, transport = "unknown", "unknown", "http"
+
+    findings, scenarios_tested = run_auth_bypass(
+        url=target, stdio_cmd=stdio_cmd,
+        original_headers=headers,
+        timeout=timeout, verbose=verbose,
+    )
+
+    result = RedTeamResult(
+        target=display, server_name=server_name, server_version=server_version,
+        transport=transport, modules_run=["auth"], findings=findings,
+        tool_count=tool_count, attack_count=scenarios_tested,
+        duration_s=time.monotonic() - t0,
+    )
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(findings, fail_on)
+
+
+# ── sentinel redteam mcp inject ───────────────────────────────────────────────
+
+@redteam_mcp_group.command("inject")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--stdio", "stdio_cmd", default=None, metavar="CMD")
+@click.option("--auth-header", "auth_header", default=None, metavar="HEADER")
+@click.option(
+    "--type", "techniques",
+    multiple=True,
+    type=click.Choice(["traverse", "ssrf", "cmd", "sqli", "llm"]),
+    metavar="TECHNIQUE",
+    help="Injection technique(s) to run. Repeatable. Default: all.",
+)
+@click.option(
+    "--intensity", type=click.Choice(["low", "medium", "high"]),
+    default="medium", show_default=True,
+    help="Payload depth. low=5, medium=15, high=full library.",
+)
+@click.option("--include-dangerous", is_flag=True, default=False,
+              help="Also test tools marked dangerous (write/delete/execute). Off by default.")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_inject(
+    target: str | None, stdio_cmd: str | None, auth_header: str | None,
+    techniques: tuple[str, ...], intensity: str, include_dangerous: bool,
+    timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """Active injection attacks per tool parameter.
+
+    Infers applicable techniques from parameter names and schemas, then fires
+    real payloads. Only raises findings when detection patterns match actual
+    response content — no false positives from error codes alone.
+
+    \b
+    Techniques:
+      traverse  Path traversal — file read via ../../../etc/passwd
+      ssrf      SSRF — internal network access via http://169.254.169.254/
+      cmd       Command injection — OS execution via ; id
+      sqli      SQL injection — database query manipulation
+      llm       LLM instruction injection — adversarial prompts via tool results
+
+    \b
+    Examples:
+        sentinel redteam mcp inject http://localhost:3000
+        sentinel redteam mcp inject http://localhost:3000 --type traverse --type ssrf
+        sentinel redteam mcp inject http://localhost:3000 --intensity high
+        sentinel redteam mcp inject http://localhost:3000 --include-dangerous
+        sentinel redteam mcp inject http://localhost:3000 --type llm --verbose
+    """
+    import time
+    from agentsentinel_cli.redteam.transport import RedTeamSession
+    from agentsentinel_cli.redteam.mcp_inject import run_inject
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+    from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
+
+    _require_target(target, stdio_cmd)
+    headers = _parse_auth_header(auth_header)
+    display = stdio_cmd or target
+
+    active_techniques = list(techniques) if techniques else ["traverse", "ssrf", "cmd", "sqli", "llm"]
+
+    t0 = time.monotonic()
+    try:
+        with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
+                            extra_headers=headers, timeout=timeout) as session:
+            findings, attack_count = run_inject(
+                session, active_techniques, intensity, include_dangerous, verbose,
+            )
+            result = RedTeamResult(
+                target=display, server_name=session.server_info.name,
+                server_version=session.server_info.version,
+                transport=session.server_info.transport,
+                modules_run=[f"inject({','.join(active_techniques)})"],
+                findings=findings, tool_count=len(session.server_info.tools),
+                attack_count=attack_count, duration_s=time.monotonic() - t0,
+            )
+    except McpAuthRequired as exc:
+        console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+        console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
+        sys.exit(1)
+    except McpError as exc:
+        console.print(f"\n[red]Connection failed:[/red] {exc}")
+        sys.exit(1)
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(findings, fail_on)
+
+
+# ── sentinel redteam mcp poison ───────────────────────────────────────────────
+
+@redteam_mcp_group.command("poison")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--stdio", "stdio_cmd", default=None, metavar="CMD")
+@click.option("--auth-header", "auth_header", default=None, metavar="HEADER")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_poison(
+    target: str | None, stdio_cmd: str | None, auth_header: str | None,
+    timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """MCP-native adversarial tests: tool description poisoning + LLM result injection.
+
+    Static: scans tool descriptions for embedded adversarial LLM instructions.
+    Dynamic: calls tools with sentinel injection payloads and checks if they're
+    echoed back — confirming a live injection vector into agent context windows.
+
+    \b
+    Examples:
+        sentinel redteam mcp poison http://localhost:3000
+        sentinel redteam mcp poison http://localhost:3000 --verbose
+        sentinel redteam mcp poison http://localhost:3000 --format json --output evidence.json
+    """
+    import time
+    from agentsentinel_cli.redteam.transport import RedTeamSession
+    from agentsentinel_cli.redteam.mcp_poison import run_poison
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+    from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
+
+    _require_target(target, stdio_cmd)
+    headers = _parse_auth_header(auth_header)
+    display = stdio_cmd or target
+
+    t0 = time.monotonic()
+    try:
+        with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
+                            extra_headers=headers, timeout=timeout) as session:
+            findings, attack_count = run_poison(session, verbose)
+            result = RedTeamResult(
+                target=display, server_name=session.server_info.name,
+                server_version=session.server_info.version,
+                transport=session.server_info.transport,
+                modules_run=["poison"], findings=findings,
+                tool_count=len(session.server_info.tools),
+                attack_count=attack_count, duration_s=time.monotonic() - t0,
+            )
+    except McpAuthRequired as exc:
+        console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+        console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
+        sys.exit(1)
+    except McpError as exc:
+        console.print(f"\n[red]Connection failed:[/red] {exc}")
+        sys.exit(1)
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(findings, fail_on)
+
+
+# ── sentinel redteam mcp fuzz ─────────────────────────────────────────────────
+
+@redteam_mcp_group.command("fuzz")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--stdio", "stdio_cmd", default=None, metavar="CMD")
+@click.option("--auth-header", "auth_header", default=None, metavar="HEADER")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_fuzz(
+    target: str | None, stdio_cmd: str | None, auth_header: str | None,
+    timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """Schema boundary and type-confusion fuzzing.
+
+    Sends malformed, oversized, null, and wrong-type inputs to every parameter.
+    Looks for stack traces, internal path leakage, template injection evaluation,
+    and unexpected data disclosure in error responses.
+
+    \b
+    Examples:
+        sentinel redteam mcp fuzz http://localhost:3000
+        sentinel redteam mcp fuzz http://localhost:3000 --verbose
+        sentinel redteam mcp fuzz --stdio "python server.py" --format json
+    """
+    import time
+    from agentsentinel_cli.redteam.transport import RedTeamSession
+    from agentsentinel_cli.redteam.mcp_fuzz import run_fuzz
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+    from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
+
+    _require_target(target, stdio_cmd)
+    headers = _parse_auth_header(auth_header)
+    display = stdio_cmd or target
+
+    t0 = time.monotonic()
+    try:
+        with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
+                            extra_headers=headers, timeout=timeout) as session:
+            findings, attack_count = run_fuzz(session, verbose)
+            result = RedTeamResult(
+                target=display, server_name=session.server_info.name,
+                server_version=session.server_info.version,
+                transport=session.server_info.transport,
+                modules_run=["fuzz"], findings=findings,
+                tool_count=len(session.server_info.tools),
+                attack_count=attack_count, duration_s=time.monotonic() - t0,
+            )
+    except McpAuthRequired as exc:
+        console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+        console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
+        sys.exit(1)
+    except McpError as exc:
+        console.print(f"\n[red]Connection failed:[/red] {exc}")
+        sys.exit(1)
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(findings, fail_on)
+
+
+# ── sentinel redteam mcp full ─────────────────────────────────────────────────
+
+@redteam_mcp_group.command("full")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--stdio", "stdio_cmd", default=None, metavar="CMD")
+@click.option("--auth-header", "auth_header", default=None, metavar="HEADER",
+              help="Valid credentials (also used as baseline for auth bypass tests).")
+@click.option(
+    "--intensity", type=click.Choice(["low", "medium", "high"]),
+    default="medium", show_default=True,
+    help="Injection payload depth.",
+)
+@click.option("--include-dangerous", is_flag=True, default=False,
+              help="Include dangerous tools in injection and fuzz tests.")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE",
+              help="Save complete JSON evidence bundle.")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_full(
+    target: str | None, stdio_cmd: str | None, auth_header: str | None,
+    intensity: str, include_dangerous: bool,
+    timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """Run all red-team modules in sequence — full engagement.
+
+    Executes: recon → auth bypass → inject (all techniques) → poison → fuzz.
+    Produces a unified report with all findings and attack statistics.
+
+    \b
+    Examples:
+        sentinel redteam mcp full http://localhost:3000
+        sentinel redteam mcp full http://localhost:3000 --intensity high --output report.json
+        sentinel redteam mcp full http://localhost:3000 --auth-header "Authorization: Bearer token"
+        sentinel redteam mcp full --stdio "python server.py" --verbose
+    """
+    import time
+    from agentsentinel_cli.redteam.transport import RedTeamSession
+    from agentsentinel_cli.redteam.mcp_recon import run_recon
+    from agentsentinel_cli.redteam.mcp_auth import run_auth_bypass
+    from agentsentinel_cli.redteam.mcp_inject import run_inject
+    from agentsentinel_cli.redteam.mcp_poison import run_poison
+    from agentsentinel_cli.redteam.mcp_fuzz import run_fuzz
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+    from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    _require_target(target, stdio_cmd)
+    headers = _parse_auth_header(auth_header)
+    display = stdio_cmd or target
+
+    all_findings: list = []
+    total_attacks = 0
+    server_name = server_version = transport = "unknown"
+    tool_count = 0
+
+    t0 = time.monotonic()
+
+    # ── Phase 1–5: run inside a single persistent session ────────────────────
+    try:
+        with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
+                            extra_headers=headers, timeout=timeout) as session:
+            server_name = session.server_info.name
+            server_version = session.server_info.version
+            transport = session.server_info.transport
+            tool_count = len(session.server_info.tools)
+
+            if fmt == "text":
+                console.print()
+                console.print(Panel.fit(
+                    f"[bold white]AgentSentinel Red Team — Full Engagement[/bold white]\n"
+                    f"[dim]Target: {display}  ·  Server: {server_name}  ·  Tools: {tool_count}[/dim]",
+                    border_style="red", padding=(0, 2),
+                ))
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[dim]{task.description}[/dim]"),
+                TimeElapsedColumn(),
+                console=console,
+                transient=True,
+            ) as progress:
+
+                task = progress.add_task("Phase 1/5 — recon…", total=None)
+                recon_findings, _ = run_recon(session, verbose)
+                all_findings.extend(recon_findings)
+
+                progress.update(task, description="Phase 2/5 — auth bypass…")
+                auth_findings, auth_scenarios = run_auth_bypass(
+                    url=target, stdio_cmd=stdio_cmd,
+                    original_headers=headers, timeout=timeout, verbose=verbose,
+                )
+                all_findings.extend(auth_findings)
+                total_attacks += auth_scenarios
+
+                progress.update(task, description="Phase 3/5 — injection…")
+                inject_findings, inject_count = run_inject(
+                    session,
+                    # LLM injection is handled by poison phase — no duplication
+                    techniques=["traverse", "ssrf", "cmd", "sqli"],
+                    intensity=intensity,
+                    include_dangerous=include_dangerous,
+                    verbose=verbose,
+                )
+                all_findings.extend(inject_findings)
+                total_attacks += inject_count
+
+                progress.update(task, description="Phase 4/5 — poisoning…")
+                poison_findings, poison_count = run_poison(session, verbose)
+                all_findings.extend(poison_findings)
+                total_attacks += poison_count
+
+                progress.update(task, description="Phase 5/5 — fuzzing…")
+                fuzz_findings, fuzz_count = run_fuzz(session, verbose)
+                all_findings.extend(fuzz_findings)
+                total_attacks += fuzz_count
+
+    except McpAuthRequired as exc:
+        console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+        console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
+        sys.exit(1)
+    except McpError as exc:
+        console.print(f"\n[red]Connection failed:[/red] {exc}")
+        sys.exit(1)
+
+    result = RedTeamResult(
+        target=display,
+        server_name=server_name,
+        server_version=server_version,
+        transport=transport,
+        modules_run=["recon", "auth", "inject", "poison", "fuzz"],
+        findings=all_findings,
+        tool_count=tool_count,
+        attack_count=total_attacks,
+        duration_s=time.monotonic() - t0,
+    )
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(all_findings, fail_on)
