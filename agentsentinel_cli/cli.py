@@ -1064,6 +1064,13 @@ def _require_target(target: str | None, stdio_cmd: str | None) -> None:
         sys.exit(1)
 
 
+def _normalize_url(url: str | None) -> str | None:
+    """Prepend http:// to bare host:port inputs (e.g. 127.0.0.1:8000 → http://127.0.0.1:8000)."""
+    if url and not url.startswith(("http://", "https://")):
+        return f"http://{url}"
+    return url
+
+
 def _check_exit(findings: list, fail_on: str | None) -> None:
     if not fail_on:
         return
@@ -1116,6 +1123,7 @@ def redteam_mcp_recon(
     from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
 
     _require_target(target, stdio_cmd)
+    target = _normalize_url(target)
     headers = _parse_auth_header(auth_header)
     display = stdio_cmd or target
 
@@ -1183,6 +1191,7 @@ def redteam_mcp_auth(
     from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
 
     _require_target(target, stdio_cmd)
+    target = _normalize_url(target)
     headers = _parse_auth_header(auth_header)
     display = stdio_cmd or target
 
@@ -1283,6 +1292,7 @@ def redteam_mcp_inject(
     from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
 
     _require_target(target, stdio_cmd)
+    target = _normalize_url(target)
     headers = _parse_auth_header(auth_header)
     display = stdio_cmd or target
 
@@ -1355,6 +1365,7 @@ def redteam_mcp_poison(
     from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
 
     _require_target(target, stdio_cmd)
+    target = _normalize_url(target)
     headers = _parse_auth_header(auth_header)
     display = stdio_cmd or target
 
@@ -1423,6 +1434,7 @@ def redteam_mcp_fuzz(
     from agentsentinel_cli.mcp_client import McpAuthRequired, McpError
 
     _require_target(target, stdio_cmd)
+    target = _normalize_url(target)
     headers = _parse_auth_header(auth_header)
     display = stdio_cmd or target
 
@@ -1506,6 +1518,7 @@ def redteam_mcp_full(
     from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 
     _require_target(target, stdio_cmd)
+    target = _normalize_url(target)
     headers = _parse_auth_header(auth_header)
     display = stdio_cmd or target
 
