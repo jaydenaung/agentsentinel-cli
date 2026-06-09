@@ -291,10 +291,15 @@ def find_evidence(technique: str, text: str) -> str | None:
     for pattern in DETECTION.get(technique, []):
         m = pattern.search(text)
         if m:
-            start = max(0, m.start() - 40)
-            end = min(len(text), m.end() + 80)
+            # Start at the beginning of the line containing the match so the
+            # snippet never starts mid-word (m.start()-40 could land mid-token).
+            line_start = text.rfind("\n", 0, m.start())
+            start = (line_start + 1) if line_start >= 0 else 0
+            # Cap how far back we go — don't include 10 unrelated lines
+            start = max(start, m.start() - 80)
+            end = min(len(text), m.end() + 120)
             snippet = text[start:end].replace("\n", "  ").strip()
-            return snippet[:200]
+            return snippet[:300]
     return None
 
 

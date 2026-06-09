@@ -62,8 +62,65 @@ def run_poison(
 
     _static_description_scan(session, findings)
     attack_count += _dynamic_result_injection(session, findings, verbose)
+    _dedup_error_echo(findings)
 
     return findings, attack_count
+
+
+def _dedup_error_echo(findings: list[RedTeamFinding]) -> None:
+    """
+    Merge same-root-cause error echo findings into one finding.
+    When multiple tools share the same parameter name and the same issue
+    (error echo), listing them separately inflates counts without adding
+    signal. Merge into one finding that lists all affected tools.
+    """
+    # Group by (attack_type, severity, confidence, parameter, title-template)
+    # where title contains "error response" — that's our dedup signal.
+    from collections import defaultdict
+    groups: dict[tuple, list[int]] = defaultdict(list)
+    for i, f in enumerate(findings):
+        if "error response" in f.title.lower() and f.attack_type == "poison":
+            key = (f.attack_type, f.severity, f.confidence, f.parameter or "")
+            groups[key].append(i)
+
+    # Only merge groups with 2+ findings; process in reverse order to preserve indices
+    to_remove: set[int] = set()
+    for key, indices in groups.items():
+        if len(indices) < 2:
+            continue
+        primary_idx = indices[0]
+        primary = findings[primary_idx]
+        affected_tools = [findings[i].tool_name for i in indices]
+        param = key[3]
+
+        findings[primary_idx] = RedTeamFinding(
+            attack_type=primary.attack_type,
+            severity=primary.severity,
+            title=(
+                f"Input reflected in error responses (injection vector) — "
+                f"{len(affected_tools)} tools affected"
+            ),
+            tool_name=", ".join(affected_tools),
+            parameter=primary.parameter,
+            payload=primary.payload,
+            evidence=primary.evidence,
+            exploit_scenario=(
+                f"Tools [{', '.join(affected_tools)}] all echo user-controlled input verbatim "
+                f"in error messages via the '{param}' parameter. Adversarial LLM instructions "
+                "injected through any of these tools will appear in a connected agent's context "
+                "window inside an error message. Whether the agent's LLM acts on error-wrapped "
+                "instructions depends on its alignment and system prompt."
+            ),
+            mitre_id=primary.mitre_id,
+            owasp_id=primary.owasp_id,
+            confidence=primary.confidence,
+            remediation=primary.remediation,
+        )
+        to_remove.update(indices[1:])
+
+    # Remove merged duplicates (in reverse order to keep indices stable)
+    for i in sorted(to_remove, reverse=True):
+        findings.pop(i)
 
 
 def _static_description_scan(
@@ -95,6 +152,11 @@ def _static_description_scan(
                     mitre_id="AML.T0051.001",
                     owasp_id="ASI04",
                     confidence="HIGH",
+                    remediation=(
+                        "Audit all tool descriptions before deployment. Remove any instructions "
+                        "targeting LLM behavior ('ignore previous instructions', role overrides, etc.). "
+                        "Descriptions should only describe what the tool does, never direct the model."
+                    ),
                 ))
                 break  # One finding per tool
 
@@ -117,6 +179,7 @@ def _static_description_scan(
                     mitre_id="AML.T0051.001",
                     owasp_id="ASI04",
                     confidence="MEDIUM",
+                    remediation="Review tool description manually and remove any covert instruction patterns.",
                 ))
                 break
 
@@ -180,6 +243,10 @@ def _dynamic_result_injection(
                         "will appear in any connected agent's context window inside an error message. "
                         "Exploitation depends on whether the agent's LLM processes error content as instructions."
                     )
+                    remediation = (
+                        f"Do not echo raw user input in error messages. Return a generic error "
+                        f"(e.g. 'invalid path') that excludes the parameter value."
+                    )
                 else:
                     severity = "HIGH"
                     confidence = "HIGH"
@@ -189,6 +256,10 @@ def _dynamic_result_injection(
                         "instructions that will be processed as trusted content by any agent "
                         "calling this tool. This enables goal hijacking without access to "
                         "the agent or its system prompt."
+                    )
+                    remediation = (
+                        "Do not reflect user-controlled parameter values in tool responses. "
+                        "Validate inputs and reject LLM instruction patterns before processing."
                     )
 
                 findings.append(RedTeamFinding(
@@ -207,6 +278,7 @@ def _dynamic_result_injection(
                     mitre_id="AML.T0051.000",
                     owasp_id="ASI01",
                     confidence=confidence,
+                    remediation=remediation,
                     request_body={"tool": tool.name, "arguments": args} if verbose else None,
                     response_body=result.raw_response[:500] if verbose else None,
                 ))

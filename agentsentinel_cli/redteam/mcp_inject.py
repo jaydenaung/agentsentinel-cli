@@ -26,6 +26,11 @@ _TECHNIQUE_META: dict[str, dict] = {
         "severity": "CRITICAL",
         "title": "Path traversal — arbitrary file read",
         "scenario": "Attacker can read arbitrary files from the server filesystem via parameter '{param}'.",
+        "remediation": (
+            "Restrict file access to an explicit allowlist of base directories. "
+            "Reject paths containing `..` sequences and absolute paths outside the allowed root. "
+            "Use os.path.realpath() and verify the resolved path starts with the allowed base."
+        ),
     },
     "ssrf": {
         "mitre": "T1090.002",
@@ -33,6 +38,11 @@ _TECHNIQUE_META: dict[str, dict] = {
         "severity": "CRITICAL",
         "title": "SSRF — server-side request forgery",
         "scenario": "Attacker can make the server issue requests to internal network addresses via '{param}'.",
+        "remediation": (
+            "Validate and allowlist permitted URL schemes and hosts. "
+            "Block RFC-1918 ranges (169.254.x.x, 10.x.x.x, 172.16-31.x.x, 192.168.x.x) and localhost. "
+            "Resolve DNS before allowlist checks to prevent TOCTOU bypasses."
+        ),
     },
     "cmd": {
         "mitre": "T1059",
@@ -40,6 +50,11 @@ _TECHNIQUE_META: dict[str, dict] = {
         "severity": "CRITICAL",
         "title": "Command injection — OS command execution",
         "scenario": "Attacker can execute arbitrary OS commands on the host via parameter '{param}'.",
+        "remediation": (
+            "Never pass user-controlled input to a shell. "
+            "Use subprocess with an explicit argument list (no shell=True). "
+            "If shell execution is required, validate against a strict allowlist."
+        ),
     },
     "sqli": {
         "mitre": "T1190",
@@ -47,6 +62,11 @@ _TECHNIQUE_META: dict[str, dict] = {
         "severity": "HIGH",
         "title": "SQL injection — database query manipulation",
         "scenario": "Attacker can manipulate backend SQL queries through parameter '{param}'.",
+        "remediation": (
+            "Use parameterized queries or a query builder. "
+            "Never interpolate user input into SQL strings. "
+            "Apply input length and character-set validation as a second layer."
+        ),
     },
     "llm": {
         "mitre": "AML.T0051.000",
@@ -56,6 +76,10 @@ _TECHNIQUE_META: dict[str, dict] = {
         "scenario": (
             "Tool result containing adversarial instructions flows into any connected LLM context "
             "via parameter '{param}'. Attacker-controlled input can override agent behaviour."
+        ),
+        "remediation": (
+            "Do not reflect user-controlled parameter values verbatim in tool responses. "
+            "Validate inputs and reject or strip LLM instruction patterns before processing."
         ),
     },
 }
@@ -140,6 +164,10 @@ def run_inject(
                             mitre_id=meta["mitre"],
                             owasp_id=meta["owasp"],
                             confidence="MEDIUM",
+                            remediation=(
+                                "Do not echo raw user input in error messages. "
+                                "Return a generic error that excludes the parameter value."
+                            ),
                             request_body={"tool": tool.name, "arguments": args} if verbose else None,
                             response_body=result.raw_response[:500] if verbose else None,
                         ))
@@ -156,6 +184,7 @@ def run_inject(
                             mitre_id=meta["mitre"],
                             owasp_id=meta["owasp"],
                             confidence="HIGH",
+                            remediation=meta.get("remediation"),
                             request_body={"tool": tool.name, "arguments": args} if verbose else None,
                             response_body=result.raw_response[:500] if verbose else None,
                         ))

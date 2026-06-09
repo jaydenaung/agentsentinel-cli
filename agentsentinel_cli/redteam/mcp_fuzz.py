@@ -138,9 +138,13 @@ def _emit(
     if is_reflection:
         severity, title = "MEDIUM", "Input reflected in error response (no HTML encoding)"
         scenario = (
-            f"Tool '{tool_name}' echoes user-controlled input without encoding via parameter '{param}'. "
-            "In an agent context, reflected content enters the LLM context window directly. "
-            "In a web UI context, this would be a stored/reflected XSS vector."
+            f"Tool '{tool_name}' echoes user-controlled input without sanitization via parameter '{param}'. "
+            "Reflected content enters any connected agent's context window directly, making this an "
+            "injection vector for adversarial instructions embedded in the input."
+        )
+        remediation = (
+            "Sanitize user input before including it in error messages. "
+            "Strip or HTML-encode special characters in all error responses."
         )
     elif is_trace:
         severity, title = "HIGH", "Unhandled exception — stack trace leaked"
@@ -149,21 +153,34 @@ def _emit(
             "Stack traces reveal internal paths, library versions, and code structure "
             "that attackers use to craft further exploits."
         )
+        remediation = (
+            "Catch all exceptions server-side and return a generic error message. "
+            "Never expose stack traces, internal paths, or library names to clients."
+        )
     elif is_template:
         severity, title = "HIGH", "Template/expression injection confirmed"
         scenario = (
-            f"Tool '{tool_name}' evaluated a template expression. "
+            f"Tool '{tool_name}' evaluated a template expression in user-controlled input. "
             "Server-side template injection can escalate to arbitrary code execution."
+        )
+        remediation = (
+            "Disable server-side template evaluation of user-controlled strings. "
+            "Use a templating engine that escapes by default and never eval user input."
         )
     elif is_path:
         severity, title = "MEDIUM", "Internal file path leaked in error response"
         scenario = (
-            f"Tool '{tool_name}' exposes an internal filesystem path. "
+            f"Tool '{tool_name}' exposes an internal filesystem path in its error response. "
             "Attackers use path disclosure to target specific files in traversal attacks."
+        )
+        remediation = (
+            "Sanitize error messages to exclude internal filesystem paths. "
+            "Return 'invalid input' without path context."
         )
     else:
         severity, title = "LOW", "Unexpected information in fuzz response"
         scenario = f"Tool '{tool_name}' returned unexpected content in response to malformed input."
+        remediation = "Review what the tool returns on unexpected input and tighten input validation."
 
     param_str = f".{param}" if param else ""
     findings.append(RedTeamFinding(
@@ -178,6 +195,7 @@ def _emit(
         mitre_id="T1592.002",
         owasp_id="ASI03",
         confidence="HIGH",
+        remediation=remediation,
         request_body={"tool": tool_name, "payload": repr(raw_payload)[:100]} if verbose else None,
         response_body=result.raw_response[:500] if verbose else None,
     ))
