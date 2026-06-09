@@ -57,8 +57,9 @@ sentinel host-scan --fail-on HIGH
 
 # Active red-team — real attacks, confirmed exploitation
 sentinel redteam mcp full http://localhost:8000
+sentinel redteam mcp preauth http://localhost:8000        # works with zero credentials
 sentinel redteam mcp inject http://localhost:8000 --type traverse --type ssrf
-sentinel redteam mcp auth http://localhost:8000
+sentinel redteam mcp auth http://localhost:8000           # credential bypass + OAuth 2.0
 ```
 
 ---
@@ -358,19 +359,26 @@ No API key required. No network calls.
 
 The active red-team module for MCP servers. Every finding is backed by confirmed evidence from the server's actual response — no heuristics, no noise. If a traversal finding says it read `/etc/passwd`, it read `/etc/passwd`.
 
+**`preauth` and OAuth probing run with zero credentials** — useful when the target server blocks unauthenticated MCP access entirely.
+
 Requires `httpx`: `pip install "agentsentinel-cli[mcp]"`
 
 ```bash
-# Full run — all 5 phases, unified report
+# Full run — all 7 phases, unified report
 sentinel redteam mcp full http://localhost:8000
 sentinel redteam mcp full http://localhost:8000 --intensity high --format json
 
 # Targeted phases
+sentinel redteam mcp preauth http://localhost:8000          # HTTP fingerprint — zero creds required
 sentinel redteam mcp recon   http://localhost:8000          # enumerate attack surface
-sentinel redteam mcp auth    http://localhost:8000          # auth bypass (5 credential scenarios)
+sentinel redteam mcp auth    http://localhost:8000          # credential bypass + OAuth 2.0 attacks
 sentinel redteam mcp inject  http://localhost:8000          # all injection techniques
 sentinel redteam mcp poison  http://localhost:8000          # tool description + result injection
 sentinel redteam mcp fuzz    http://localhost:8000          # schema and type boundary fuzzing
+
+# Preauth — works even when server blocks unauthenticated MCP
+sentinel redteam mcp preauth http://localhost:8000
+sentinel redteam mcp preauth http://locked-server:8000      # CORS, OAuth metadata, version disclosure
 
 # Surgical injection — pick your techniques
 sentinel redteam mcp inject http://localhost:8000 --type traverse
@@ -391,15 +399,31 @@ sentinel redteam mcp full http://localhost:8000 --fail-on CRITICAL
 sentinel redteam mcp full http://localhost:8000 --output report.json
 ```
 
-**Phases:**
+**Phases (`full` runs all 7):**
 
-| Phase | Command | What it tests |
-|-------|---------|---------------|
-| 1 — Recon | `recon` | Tool inventory, resource listing, dangerous capability flags |
-| 2 — Auth Bypass | `auth` | 5 credential scenarios: no creds, empty bearer, garbage token, invalid JWT, JWT alg:none |
-| 3 — Injection | `inject` | Path traversal, SSRF, command injection, SQL injection — payload fired, pattern matched in response |
-| 4 — Poison | `poison` | Static: adversarial instructions in tool descriptions. Dynamic: LLM instruction injection via tool parameters |
-| 5 — Fuzz | `fuzz` | Stack traces, internal path disclosure, template injection eval, type confusion |
+| Phase | Command | Needs credentials | What it tests |
+|-------|---------|:-----------------:|---------------|
+| 1 — Pre-auth | `preauth` | No | CORS, OAuth metadata, version disclosure, unauthenticated paths, SSE stream, error disclosure |
+| 2 — OAuth | *(auto in `auth`/`full`)* | No | Public client registration, token without secret, PKCE downgrade, scope escalation, X-Agent-Scopes forgery |
+| 3 — Recon | `recon` | Yes | Tool inventory, resource listing, dangerous capability flags with input schemas |
+| 4 — Auth Bypass | `auth` | Optional | 5 credential scenarios: no creds, empty bearer, garbage token, invalid JWT, JWT alg:none |
+| 5 — Injection | `inject` | Yes | Path traversal, SSRF, command injection, SQL injection — evidence-confirmed only |
+| 6 — Poison | `poison` | Yes | Adversarial instructions in tool descriptions; LLM injection via tool parameters |
+| 7 — Fuzz | `fuzz` | Yes | Stack traces, path disclosure, template injection eval, type confusion, input reflection |
+
+**Pre-auth probes (zero credentials):**
+
+| Probe | CRITICAL | HIGH | MEDIUM |
+|-------|----------|------|--------|
+| CORS wildcard + credentials | ✓ | | |
+| CORS wildcard / reflected origin | | ✓ | |
+| Unauthenticated SSE stream | | ✓ | |
+| Public OAuth client registration | | ✓ | |
+| Token issued without `client_secret` | ✓ | | |
+| X-Agent-Scopes header forgery | ✓ | | |
+| PKCE `plain` method accepted | | | ✓ |
+| Server/framework version disclosure | | | ✓ |
+| Unauthenticated `/docs`, `/metrics` | | | ✓ |
 
 **Injection techniques (`--type`):**
 
@@ -423,13 +447,13 @@ sentinel redteam mcp full http://localhost:8000 --output report.json
 
 | Severity | Example |
 |----------|---------|
-| CRITICAL | Path traversal confirmed — `/etc/passwd` content in response |
-| HIGH | LLM instruction injection — sentinel reflected in clean tool result |
-| MEDIUM | Input reflected in error message (injection vector, lower confidence) |
+| CRITICAL | Path traversal confirmed — `/etc/passwd` content in response; OAuth token issued without secret |
+| HIGH | LLM instruction injection — sentinel reflected in clean tool result; CORS wildcard |
+| MEDIUM | Input reflected in error message; PKCE plain method accepted; version disclosure |
 | LOW | Unexpected content returned on malformed input |
-| INFO | Auth enforced on handshake, tool inventory |
+| INFO | Auth enforced on handshake, tool inventory, OAuth metadata discovered |
 
-Every finding includes a **MITRE ATLAS** ID and **OWASP ASI** ID. Use `--verbose` to see full request/response bodies.
+Every finding includes a **Fix** line, a **MITRE ATLAS** ID, and an **OWASP ASI** ID. Confirmed multi-step attack chains are synthesized in the report. Use `--verbose` to see full request/response bodies.
 
 ---
 
@@ -462,10 +486,10 @@ Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel su
 |------------|-----|------------------|
 | Agent Goal Hijack | ASI01 | `sentinel scan` (PROMPT_INJECTION_VECTOR), `sentinel supply-chain` (SC01), **`sentinel redteam mcp poison`** (confirmed injection) |
 | Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan`, **`sentinel redteam mcp inject`** (confirmed exploitation) |
-| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED), **`sentinel redteam mcp auth`** (bypass confirmation) |
+| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED), **`sentinel redteam mcp auth`** (credential bypass + OAuth scope escalation + X-Agent-Scopes forgery) |
 | **Agentic Supply Chain Compromise** | **ASI04** | **`sentinel supply-chain`** (static + AI semantic analysis), **`sentinel redteam mcp poison`** (static description scan) |
 | Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` (CODE_EXECUTION_TOOL), **`sentinel redteam mcp inject --type cmd`** |
-| **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination, system prompt leakage), `sentinel host-scan` (HOST_LARGE_MEMORY) |
+| **Memory & Context Poisoning** | **ASI06** | **`sentinel secrets`** (memory contamination, system prompt leakage), `sentinel host-scan` (HOST_LARGE_MEMORY), **`sentinel redteam mcp preauth`** (CORS misconfiguration enabling cross-origin data theft) |
 | **Insecure Inter-Agent Communication** | **ASI07** | **`sentinel a2a`** (call graph + trust rules) |
 | Cascading Agent Failures | ASI08 | `sentinel discover` (surface unmonitored agents) |
 | Rogue Agents | ASI10 | `sentinel discover` (find agents that shouldn't exist), `sentinel host-scan` (HOST_AI_PROCESS_EXPOSED) |
@@ -505,6 +529,9 @@ jobs:
 
       - name: Host AI security posture
         run: sentinel host-scan --fail-on HIGH
+
+      - name: MCP pre-auth probe (zero credentials needed)
+        run: sentinel redteam mcp preauth http://localhost:8000 --fail-on HIGH
 
       - name: MCP red-team (active exploitation check)
         run: sentinel redteam mcp full http://localhost:8000 --fail-on CRITICAL
