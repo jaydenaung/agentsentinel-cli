@@ -32,6 +32,7 @@ def run_oauth(
     original_headers: dict[str, str],
     timeout: float,
     verbose: bool,
+    skip_external: bool = False,
 ) -> tuple[list[RedTeamFinding], int]:
     """
     Run OAuth 2.0 attack surface tests.
@@ -45,16 +46,59 @@ def run_oauth(
     findings: list[RedTeamFinding] = []
     probes = 0
     parsed = urllib.parse.urlparse(url.rstrip("/"))
-    origin = f"{parsed.scheme}://{parsed.netloc}"
+    mcp_origin = f"{parsed.scheme}://{parsed.netloc}"
 
     with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        meta = _discover_metadata(client, origin)
+        meta, as_origin, is_external = _discover_metadata(client, mcp_origin)
 
         if meta is None:
-            # No OAuth server found — nothing to test
-            return findings, probes + 3  # count the 3 discovery probes
+            return findings, probes + 3  # count the discovery probes
 
-        probes += 3  # metadata probes
+        probes += 3
+
+        # Report external AS — always emit the INFO, then optionally skip tests
+        if is_external:
+            findings.append(RedTeamFinding(
+                attack_type="oauth",
+                severity="INFO",
+                title=f"External OAuth AS discovered — {as_origin}",
+                tool_name="<auth-server>",
+                parameter=None,
+                payload=f"GET {mcp_origin}/.well-known/oauth-protected-resource",
+                evidence=(
+                    f"MCP server ({mcp_origin}) delegates authentication to:\n"
+                    f"  Authorization server: {as_origin}\n"
+                    f"  token_endpoint: {meta.get('token_endpoint', 'unknown')}"
+                ),
+                exploit_scenario=(
+                    "The MCP server follows the MCP 2025 spec and delegates OAuth to a "
+                    f"separate authorization server at {as_origin}. "
+                    "All OAuth attack tests below target that AS directly. "
+                    "Use --skip-oauth if this AS is out of scope for your engagement."
+                ),
+                mitre_id="T1078.004",
+                owasp_id="ASI06",
+                confidence="HIGH",
+            ))
+
+            if skip_external:
+                findings.append(RedTeamFinding(
+                    attack_type="oauth",
+                    severity="INFO",
+                    title=f"OAuth tests skipped — external AS out of scope (--skip-oauth)",
+                    tool_name="<auth-server>",
+                    parameter=None,
+                    payload="",
+                    evidence=f"Authorization server at {as_origin} not tested per --skip-oauth.",
+                    exploit_scenario=(
+                        "OAuth attack tests were suppressed because --skip-oauth was set. "
+                        "Re-run without --skip-oauth if you have authorization to test the AS."
+                    ),
+                    mitre_id=None,
+                    owasp_id=None,
+                    confidence="HIGH",
+                ))
+                return findings, probes
 
         # Tests that don't need a valid token
         probes += _test_public_registration(client, meta, findings, verbose)
@@ -71,21 +115,61 @@ def run_oauth(
     return findings, probes
 
 
-def _discover_metadata(client, origin: str) -> dict | None:
-    """Discover OAuth metadata from well-known endpoints."""
-    paths = [
+def _discover_metadata(
+    client,
+    mcp_origin: str,
+) -> tuple[dict | None, str, bool]:
+    """
+    Follow the MCP 2025 OAuth discovery chain.
+
+    Returns (metadata, as_origin, is_external):
+      metadata    — OAuth AS metadata dict, or None if no AS found
+      as_origin   — base URL where the AS lives (may differ from MCP server)
+      is_external — True when the AS is hosted on a different origin
+    """
+    # Step 1: MCP 2025 spec — oauth-protected-resource on the MCP server
+    # advertises which authorization server to use
+    try:
+        resp = client.get(f"{mcp_origin}/.well-known/oauth-protected-resource")
+        if resp.status_code == 200:
+            protected = resp.json()
+            auth_servers = protected.get("authorization_servers", [])
+            if auth_servers:
+                as_base = auth_servers[0].rstrip("/")
+                as_meta = _fetch_as_metadata(client, as_base)
+                if as_meta:
+                    return as_meta, as_base, _is_different_origin(mcp_origin, as_base)
+    except Exception:
+        pass
+
+    # Step 2: Co-located AS — check AS metadata directly on MCP server origin
+    as_meta = _fetch_as_metadata(client, mcp_origin)
+    if as_meta:
+        return as_meta, mcp_origin, False
+
+    return None, mcp_origin, False
+
+
+def _fetch_as_metadata(client, base_url: str) -> dict | None:
+    """Try standard OAuth AS discovery paths on a given base URL."""
+    for path in [
         "/.well-known/oauth-authorization-server",
         "/.well-known/openid-configuration",
-        "/.well-known/oauth-protected-resource",
-    ]
-    for path in paths:
+    ]:
         try:
-            resp = client.get(f"{origin}{path}")
+            resp = client.get(f"{base_url}{path}")
             if resp.status_code == 200:
                 return resp.json()
         except Exception:
             continue
     return None
+
+
+def _is_different_origin(url1: str, url2: str) -> bool:
+    """Return True when url1 and url2 have different scheme+host+port."""
+    p1 = urllib.parse.urlparse(url1)
+    p2 = urllib.parse.urlparse(url2)
+    return p1.netloc != p2.netloc
 
 
 def _test_public_registration(

@@ -291,6 +291,10 @@ def _probe_oauth_metadata(
     parsed = urllib.parse.urlparse(base)
     origin = f"{parsed.scheme}://{parsed.netloc}"
 
+    # Track registration endpoints already reported to avoid duplicate findings
+    # when both oauth-authorization-server and openid-configuration expose the same URL
+    seen_reg_endpoints: set[str] = set()
+
     for path in _OAUTH_META_PATHS:
         probes += 1
         try:
@@ -306,7 +310,68 @@ def _probe_oauth_metadata(
         except Exception:
             continue
 
-        # Interesting fields
+        # ── oauth-protected-resource (MCP 2025 spec) ──────────────────────────
+        # This document is on the MCP *resource* server and points to the real AS.
+        if path == "/.well-known/oauth-protected-resource":
+            auth_servers = meta.get("authorization_servers", [])
+            resource_fields: list[str] = []
+            for key in ("resource", "scopes_provided", "bearer_methods_supported"):
+                if key in meta:
+                    resource_fields.append(f"{key}: {meta[key]}")
+
+            if auth_servers:
+                as_url = auth_servers[0]
+                is_ext = _netloc(origin) != _netloc(as_url)
+                placement = "external" if is_ext else "co-located"
+                findings.append(RedTeamFinding(
+                    attack_type="preauth",
+                    severity="INFO",
+                    title=(
+                        f"MCP 2025 OAuth discovery: AS at {as_url} ({placement})"
+                    ),
+                    tool_name="<server>",
+                    parameter=None,
+                    payload=f"GET {path}",
+                    evidence=(
+                        f"authorization_servers: {auth_servers}\n"
+                        + "\n".join(resource_fields[:3])
+                    ),
+                    exploit_scenario=(
+                        f"The MCP server advertises its authorization server at {as_url}. "
+                        + (
+                            "The AS is hosted on a separate origin — OAuth attack tests "
+                            "should target that AS directly. "
+                            "Use `sentinel redteam mcp auth <mcp-url>` to follow the chain "
+                            "and test the external AS."
+                            if is_ext else
+                            "The AS is co-located on the same host — OAuth tests against "
+                            "this origin will reach the authorization server."
+                        )
+                    ),
+                    mitre_id="T1590",
+                    owasp_id=None,
+                    confidence="HIGH",
+                ))
+            else:
+                findings.append(RedTeamFinding(
+                    attack_type="preauth",
+                    severity="INFO",
+                    title=f"MCP protected-resource metadata discovered — {path}",
+                    tool_name="<server>",
+                    parameter=None,
+                    payload=f"GET {path}",
+                    evidence="\n".join(resource_fields[:6]),
+                    exploit_scenario=(
+                        "The MCP server exposes its OAuth protected-resource document. "
+                        "This identifies the authorization server and permitted scopes."
+                    ),
+                    mitre_id="T1590",
+                    owasp_id=None,
+                    confidence="HIGH",
+                ))
+            continue  # rest of the loop handles AS metadata paths
+
+        # ── oauth-authorization-server / openid-configuration ─────────────────
         endpoints: list[str] = []
         for key in ("authorization_endpoint", "token_endpoint", "registration_endpoint",
                     "introspection_endpoint", "revocation_endpoint"):
@@ -318,8 +383,10 @@ def _probe_oauth_metadata(
 
         has_registration = "registration_endpoint" in meta
         has_implicit = "implicit" in grant_types or "token" in grant_types
+        reg_url = meta.get("registration_endpoint", "")
 
-        if has_registration:
+        if has_registration and reg_url not in seen_reg_endpoints:
+            seen_reg_endpoints.add(reg_url)
             findings.append(RedTeamFinding(
                 attack_type="preauth",
                 severity="HIGH",
@@ -328,7 +395,7 @@ def _probe_oauth_metadata(
                 parameter=None,
                 payload=f"GET {path}",
                 evidence=(
-                    f"registration_endpoint: {meta['registration_endpoint']}\n"
+                    f"registration_endpoint: {reg_url}\n"
                     + "\n".join(endpoints[:5])
                 ),
                 exploit_scenario=(
@@ -346,6 +413,8 @@ def _probe_oauth_metadata(
                     "Disable public registration unless explicitly required."
                 ),
             ))
+        elif has_registration and reg_url in seen_reg_endpoints:
+            pass  # same registration_endpoint already reported via another path
         elif has_implicit:
             findings.append(RedTeamFinding(
                 attack_type="preauth",
@@ -369,7 +438,6 @@ def _probe_oauth_metadata(
                 ),
             ))
         else:
-            # Just an INFO finding for the metadata itself
             findings.append(RedTeamFinding(
                 attack_type="preauth",
                 severity="INFO",
@@ -388,6 +456,11 @@ def _probe_oauth_metadata(
             ))
 
     return probes
+
+
+def _netloc(url: str) -> str:
+    """Extract scheme+netloc from a URL for origin comparison."""
+    return urllib.parse.urlparse(url).netloc
 
 
 def _probe_info_paths(

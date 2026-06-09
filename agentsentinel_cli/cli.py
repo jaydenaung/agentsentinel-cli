@@ -1166,20 +1166,25 @@ def redteam_mcp_recon(
 @click.option("--output", "output_path", default=None, metavar="FILE")
 @click.option("--verbose", "-v", is_flag=True, default=False)
 @click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+@click.option("--skip-oauth", "skip_oauth", is_flag=True, default=False,
+              help="Skip OAuth tests against external authorization servers (use when AS is out of scope).")
 def redteam_mcp_preauth(
     target: str | None, timeout: float, fmt: str,
     output_path: str | None, verbose: bool, fail_on: str | None,
+    skip_oauth: bool,
 ) -> None:
     """HTTP-layer fingerprinting — runs with zero credentials.
 
     Probes the server before any MCP initialize attempt: CORS config,
     OAuth metadata, version disclosure, unauthenticated paths, SSE stream.
+    Follows the MCP 2025 OAuth discovery chain to find external auth servers.
     Produces findings even when the server blocks unauthenticated MCP access.
 
     \b
     Examples:
         sentinel redteam mcp preauth http://localhost:3000
         sentinel redteam mcp preauth http://localhost:3000 --verbose
+        sentinel redteam mcp preauth http://localhost:3000 --skip-oauth
     """
     import time
     from agentsentinel_cli.redteam.mcp_preauth import run_preauth
@@ -1198,6 +1203,7 @@ def redteam_mcp_preauth(
     preauth_findings, preauth_count = run_preauth(url=target, timeout=timeout, verbose=verbose)
     oauth_findings, oauth_count = run_oauth(
         url=target, original_headers={}, timeout=timeout, verbose=verbose,
+        skip_external=skip_oauth,
     )
     all_findings = preauth_findings + oauth_findings
 
@@ -1229,9 +1235,12 @@ def redteam_mcp_preauth(
 @click.option("--output", "output_path", default=None, metavar="FILE")
 @click.option("--verbose", "-v", is_flag=True, default=False)
 @click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+@click.option("--skip-oauth", "skip_oauth", is_flag=True, default=False,
+              help="Skip OAuth tests against external authorization servers.")
 def redteam_mcp_auth(
     target: str | None, stdio_cmd: str | None, auth_header: str | None,
     timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+    skip_oauth: bool,
 ) -> None:
     """Test authentication bypass — calls every tool with invalid credentials.
 
@@ -1281,6 +1290,7 @@ def redteam_mcp_auth(
         from agentsentinel_cli.redteam.mcp_oauth import run_oauth
         oauth_findings, oauth_count = run_oauth(
             url=target, original_headers=headers, timeout=timeout, verbose=verbose,
+            skip_external=skip_oauth,
         )
         findings = findings + oauth_findings
         scenarios_tested += oauth_count
@@ -1557,10 +1567,13 @@ def redteam_mcp_fuzz(
               help="Save complete JSON evidence bundle.")
 @click.option("--verbose", "-v", is_flag=True, default=False)
 @click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+@click.option("--skip-oauth", "skip_oauth", is_flag=True, default=False,
+              help="Skip OAuth tests against external authorization servers.")
 def redteam_mcp_full(
     target: str | None, stdio_cmd: str | None, auth_header: str | None,
     intensity: str, include_dangerous: bool,
     timeout: float, fmt: str, output_path: str | None, verbose: bool, fail_on: str | None,
+    skip_oauth: bool,
 ) -> None:
     """Run all red-team modules in sequence — full engagement.
 
@@ -1610,6 +1623,7 @@ def redteam_mcp_full(
 
         oauth_findings, oauth_count = run_oauth(
             url=target, original_headers=headers, timeout=timeout, verbose=verbose,
+            skip_external=skip_oauth,
         )
         all_findings.extend(oauth_findings)
         total_attacks += oauth_count
@@ -1673,14 +1687,16 @@ def redteam_mcp_full(
                 total_attacks += fuzz_count
 
     except McpAuthRequired as exc:
-        console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
-        console.print("  Preauth + OAuth findings above are still valid without a token.")
-        console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
+        if fmt == "text":
+            console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+            console.print("  Preauth + OAuth findings above are still valid without a token.")
+            console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
         if not all_findings:
             sys.exit(1)
         # Fall through — report whatever preauth/oauth found
     except McpError as exc:
-        console.print(f"\n[red]Connection failed:[/red] {exc}")
+        if fmt == "text":
+            console.print(f"\n[red]Connection failed:[/red] {exc}")
         if not all_findings:
             sys.exit(1)
 
