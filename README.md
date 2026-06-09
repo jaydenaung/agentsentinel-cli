@@ -57,9 +57,10 @@ sentinel host-scan --fail-on HIGH
 
 # Active red-team — real attacks, confirmed exploitation
 sentinel redteam mcp full http://localhost:8000
-sentinel redteam mcp preauth http://localhost:8000        # works with zero credentials
+sentinel redteam mcp preauth http://localhost:8000              # zero credentials — follows MCP 2025 OAuth chain
+sentinel redteam mcp preauth http://localhost:8000 --skip-oauth # skip external AS if out of scope
 sentinel redteam mcp inject http://localhost:8000 --type traverse --type ssrf
-sentinel redteam mcp auth http://localhost:8000           # credential bypass + OAuth 2.0
+sentinel redteam mcp auth http://localhost:8000                 # credential bypass + OAuth 2.0
 ```
 
 ---
@@ -359,7 +360,7 @@ No API key required. No network calls.
 
 The active red-team module for MCP servers. Every finding is backed by confirmed evidence from the server's actual response — no heuristics, no noise. If a traversal finding says it read `/etc/passwd`, it read `/etc/passwd`.
 
-**`preauth` and OAuth probing run with zero credentials** — useful when the target server blocks unauthenticated MCP access entirely.
+**Phases 1–2 (`preauth` + OAuth) run with zero credentials** — useful when the target server blocks unauthenticated MCP access entirely. `sentinel` follows the full MCP 2025 OAuth discovery chain to find and test the real authorization server, even when it sits on a separate host.
 
 Requires `httpx`: `pip install "agentsentinel-cli[mcp]"`
 
@@ -378,7 +379,11 @@ sentinel redteam mcp fuzz    http://localhost:8000          # schema and type bo
 
 # Preauth — works even when server blocks unauthenticated MCP
 sentinel redteam mcp preauth http://localhost:8000
-sentinel redteam mcp preauth http://locked-server:8000      # CORS, OAuth metadata, version disclosure
+sentinel redteam mcp preauth http://locked-server:8000      # CORS, OAuth discovery, version disclosure
+
+# Skip OAuth tests against an external AS that is out of scope
+sentinel redteam mcp preauth http://localhost:8000 --skip-oauth
+sentinel redteam mcp full    http://localhost:8000 --skip-oauth
 
 # Surgical injection — pick your techniques
 sentinel redteam mcp inject http://localhost:8000 --type traverse
@@ -395,47 +400,95 @@ sentinel redteam mcp full --stdio "python my_mcp_server.py"
 # CI gate — fail if any CRITICAL confirmed
 sentinel redteam mcp full http://localhost:8000 --fail-on CRITICAL
 
-# Save report
+# Save full evidence bundle
 sentinel redteam mcp full http://localhost:8000 --output report.json
 ```
 
-**Phases (`full` runs all 7):**
+---
+
+#### Phases (`full` runs all 7)
 
 | Phase | Command | Needs credentials | What it tests |
 |-------|---------|:-----------------:|---------------|
-| 1 — Pre-auth | `preauth` | No | CORS, OAuth metadata, version disclosure, unauthenticated paths, SSE stream, error disclosure |
-| 2 — OAuth | *(auto in `auth`/`full`)* | No | Public client registration, token without secret, PKCE downgrade, scope escalation, X-Agent-Scopes forgery |
-| 3 — Recon | `recon` | Yes | Tool inventory, resource listing, dangerous capability flags with input schemas |
-| 4 — Auth Bypass | `auth` | Optional | 5 credential scenarios: no creds, empty bearer, garbage token, invalid JWT, JWT alg:none |
+| 1 — Pre-auth probe | `preauth` | No | CORS policy, version disclosure, unauthenticated paths, SSE stream, error disclosure |
+| 2 — OAuth attack surface | *(auto in `preauth`/`auth`/`full`)* | No | MCP 2025 discovery chain, client registration, token acquisition, PKCE, scope attacks |
+| 3 — Recon | `recon` | Yes | Full tool inventory with input schemas; dangerous capability detection |
+| 4 — Auth bypass | `auth` | Optional | 5 credential scenarios: no creds, empty bearer, garbage token, expired JWT, JWT alg:none |
 | 5 — Injection | `inject` | Yes | Path traversal, SSRF, command injection, SQL injection — evidence-confirmed only |
-| 6 — Poison | `poison` | Yes | Adversarial instructions in tool descriptions; LLM injection via tool parameters |
+| 6 — Poison | `poison` | Yes | Adversarial instructions in tool descriptions; LLM injection via tool result parameters |
 | 7 — Fuzz | `fuzz` | Yes | Stack traces, path disclosure, template injection eval, type confusion, input reflection |
 
-**Pre-auth probes (zero credentials):**
+---
 
-| Probe | CRITICAL | HIGH | MEDIUM |
-|-------|----------|------|--------|
-| CORS wildcard + credentials | ✓ | | |
-| CORS wildcard / reflected origin | | ✓ | |
-| Unauthenticated SSE stream | | ✓ | |
-| Public OAuth client registration | | ✓ | |
-| Token issued without `client_secret` | ✓ | | |
-| X-Agent-Scopes header forgery | ✓ | | |
-| PKCE `plain` method accepted | | | ✓ |
-| Server/framework version disclosure | | | ✓ |
-| Unauthenticated `/docs`, `/metrics` | | | ✓ |
+#### Pre-auth probes — what each check does
 
-**Injection techniques (`--type`):**
+All probes in Phase 1 run over plain HTTP before any MCP handshake. No credentials required.
+
+| Probe | Sev | What it checks | Why it matters |
+|-------|-----|----------------|----------------|
+| **CORS wildcard + credentials** | CRITICAL | `Access-Control-Allow-Origin: *` with `Access-Control-Allow-Credentials: true` | Any website can make credentialed requests to MCP endpoints and read tool responses from the victim's browser session |
+| **CORS wildcard** | HIGH | `Access-Control-Allow-Origin: *` without credentials | Any website can read MCP responses — exfiltrates tool output if the user visits a malicious page |
+| **CORS reflected origin** | HIGH | Server echoes the request `Origin` header back | Equivalent to wildcard CORS — attacker sets any origin and the browser permits the cross-origin read |
+| **Unauthenticated SSE stream** | HIGH | `GET /sse` returns `text/event-stream` without a token | Attacker connects and receives a live feed of all MCP events: tool results, agent responses, server notifications |
+| **MCP 2025 oauth-protected-resource** | INFO | `/.well-known/oauth-protected-resource` — identifies the authorization server and its location | Maps the OAuth topology (co-located vs. external AS); informs which server the OAuth attack tests target |
+| **Public client registration endpoint** | HIGH | OAuth AS exposes `registration_endpoint` without authentication | Attacker registers a new OAuth client, obtains a valid `client_id`, and can initiate authorization flows |
+| **Implicit grant supported** | MEDIUM | `grant_types_supported` includes `implicit` or `token` | Implicit flow exposes access tokens in URL fragments — capturable via browser history, referrer headers, or injected scripts |
+| **Server / framework version disclosure** | MEDIUM | `Server:` response header, `X-Powered-By:`, or version string in error body | Attacker maps exact framework versions to known CVEs without any authentication |
+| **Unauthenticated `/docs` / `/openapi.json`** | MEDIUM | API schema is readable without credentials | Exposes every endpoint, parameter, and schema — lets attacker fully map the attack surface before sending a single payload |
+| **Unauthenticated `/metrics`** | MEDIUM | Prometheus/metrics endpoint accessible | Runtime internals (request counts, error rates, memory usage) reveal traffic patterns and anomaly detection thresholds |
+| **Unauthenticated `/debug` or `/admin`** | HIGH | Admin/debug endpoint accessible without credentials | These endpoints frequently expose sensitive operations, config dumps, or runtime state |
+| **Stack trace in error response** | HIGH | Malformed requests trigger a full stack trace | Internal file paths, library versions, and code structure are exposed to unauthenticated callers |
+| **Framework version in error body** | MEDIUM | Error body contains a framework/version string | Same CVE-mapping risk as the Server header, triggered by a different probe vector |
+| **Security headers missing** | LOW | Absent `X-Content-Type-Options`, `Content-Security-Policy`, `X-Frame-Options` | Missing defensive headers expand attack surface for MIME sniffing, clickjacking, and content injection |
+
+---
+
+#### OAuth 2.0 attack surface — how the discovery chain works
+
+The MCP 2025 spec mandates OAuth 2.0. An MCP server is an OAuth **resource server** — it validates tokens but doesn't issue them. The **authorization server** (the service that issues tokens) is often a separate host: Auth0, Okta, Keycloak, AWS Cognito, Azure AD.
+
+`sentinel` follows the full RFC 9728 discovery chain automatically:
+
+```
+1. GET /.well-known/oauth-protected-resource   (on the MCP server)
+        ↓  authorization_servers: ["https://auth.company.com"]
+2. GET https://auth.company.com/.well-known/oauth-authorization-server
+        ↓  token_endpoint, registration_endpoint, authorization_endpoint
+3. Run all OAuth attack tests against the real AS endpoints
+```
+
+**Co-located AS** (dev/test setups): both MCP server and AS run on the same origin (e.g. `localhost:8000`). Tests run automatically and the INFO finding says `(co-located)`.
+
+**Separate AS** (production): MCP server at `api.company.com`, AS at `auth.company.com`. `sentinel` follows the pointer, emits an INFO finding naming the external AS, then runs all OAuth tests against the real AS endpoints. Use `--skip-oauth` if the external AS is a third-party service outside your engagement scope.
+
+**OAuth tests — what each one checks:**
+
+| Test | Severity if confirmed | What `sentinel` does | Attacker impact if found |
+|------|----------------------|---------------------|--------------------------|
+| **Public client registration** | CRITICAL | `POST /registration_endpoint` with a new client payload, no auth header | Attacker registers a client, obtains a valid `client_id`, initiates auth flows against real users |
+| **Token without `client_secret`** | CRITICAL | `POST /token` with `grant_type=client_credentials` and only a `client_id` | Any attacker who knows or guesses a `client_id` gets a valid access token — no secret required |
+| **Token with empty `client_secret`** | CRITICAL | Same as above but `client_secret=""` | Empty string is accepted as valid — credential check is bypassed entirely |
+| **PKCE plain method** | MEDIUM | `GET /authorize?code_challenge_method=plain` — checks if server accepts instead of rejecting | Code verifier transmitted in cleartext during token exchange; interceptable via logs, proxies, or referrer headers. MCP 2025 spec requires S256. |
+| **Scope escalation** | HIGH | Token refresh requesting all supported scopes | Low-privilege token trades up to higher-privilege scopes — breaks least-privilege enforcement |
+| **X-Agent-Scopes forgery** | CRITICAL | Authenticated MCP tool call with forged `X-Agent-Scopes` header | If server trusts the client-supplied header, any authenticated agent can invoke tools outside its granted scope |
+
+---
+
+#### Injection techniques (`--type`)
 
 | Technique | What it confirms |
 |-----------|-----------------|
-| `traverse` | Arbitrary file read via path traversal — evidence: `/etc/passwd` content, `.env` keys |
-| `ssrf` | Server-side request forgery — evidence: AWS IMDS tokens, Redis/SSH banners, cloud metadata |
-| `cmd` | OS command injection — evidence: `uid=0(root)` from `id`, `REDTEAM_CMD_CONFIRMED` sentinel |
+| `traverse` | Arbitrary file read via path traversal — evidence: actual `/etc/passwd` content, `.env` key values |
+| `ssrf` | Server-side request forgery — evidence: AWS IMDS tokens, Redis/SSH service banners, cloud metadata responses |
+| `cmd` | OS command injection — evidence: `uid=0(root)` from `id`, `REDTEAM_CMD_CONFIRMED` sentinel value |
 | `sqli` | SQL injection — evidence: DB error messages (`ORA-`, `You have an error in your SQL syntax`) |
-| `llm` | LLM instruction injection via tool result — evidence: sentinel string echoed in clean response |
+| `llm` | LLM instruction injection via tool result — evidence: sentinel instruction string echoed in clean response |
 
-**Intensity levels (`--intensity`):**
+Findings are only raised when a detection pattern matches the actual response body. A 500 error alone is never reported as a finding.
+
+---
+
+#### Intensity levels (`--intensity`)
 
 | Level | Payloads per technique | Use case |
 |-------|----------------------|----------|
@@ -443,17 +496,19 @@ sentinel redteam mcp full http://localhost:8000 --output report.json
 | `medium` | 15 | Standard engagement (default) |
 | `high` | Full library (~20) | Thorough pentest |
 
-**Finding severities:**
+---
+
+#### Finding severities
 
 | Severity | Example |
 |----------|---------|
 | CRITICAL | Path traversal confirmed — `/etc/passwd` content in response; OAuth token issued without secret |
 | HIGH | LLM instruction injection — sentinel reflected in clean tool result; CORS wildcard |
 | MEDIUM | Input reflected in error message; PKCE plain method accepted; version disclosure |
-| LOW | Unexpected content returned on malformed input |
-| INFO | Auth enforced on handshake, tool inventory, OAuth metadata discovered |
+| LOW | Security headers missing; unexpected content on malformed input |
+| INFO | Auth enforced on handshake; tool inventory; OAuth AS topology discovered |
 
-Every finding includes a **Fix** line, a **MITRE ATLAS** ID, and an **OWASP ASI** ID. Confirmed multi-step attack chains are synthesized in the report. Use `--verbose` to see full request/response bodies.
+Every finding includes a **Fix** line, **MITRE ATLAS** ID, and **OWASP ASI** ID. Confirmed multi-step attack chains (e.g. path-traversal + shell-exec → full host compromise) are synthesized automatically in the report. Use `--verbose` to see full request/response bodies in every finding.
 
 ---
 
