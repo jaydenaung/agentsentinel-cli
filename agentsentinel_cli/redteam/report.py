@@ -37,6 +37,8 @@ _ATTACK_LABEL: dict[str, str] = {
     "sqli":     "SQL INJECTION",
     "llm":      "LLM INJECTION",
     "auth":     "AUTH BYPASS",
+    "oauth":    "OAUTH",
+    "preauth":  "PRE-AUTH PROBE",
     "poison":   "TOOL POISONING",
     "fuzz":     "FUZZING",
     "recon":    "RECON",

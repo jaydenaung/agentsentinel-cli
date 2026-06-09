@@ -1157,6 +1157,66 @@ def redteam_mcp_recon(
     _check_exit(findings, fail_on)
 
 
+# ── sentinel redteam mcp preauth ─────────────────────────────────────────────
+
+@redteam_mcp_group.command("preauth")
+@click.argument("target", required=False, metavar="URL")
+@click.option("--timeout", default=15.0, show_default=True, metavar="SECONDS")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
+@click.option("--output", "output_path", default=None, metavar="FILE")
+@click.option("--verbose", "-v", is_flag=True, default=False)
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]), default=None)
+def redteam_mcp_preauth(
+    target: str | None, timeout: float, fmt: str,
+    output_path: str | None, verbose: bool, fail_on: str | None,
+) -> None:
+    """HTTP-layer fingerprinting — runs with zero credentials.
+
+    Probes the server before any MCP initialize attempt: CORS config,
+    OAuth metadata, version disclosure, unauthenticated paths, SSE stream.
+    Produces findings even when the server blocks unauthenticated MCP access.
+
+    \b
+    Examples:
+        sentinel redteam mcp preauth http://localhost:3000
+        sentinel redteam mcp preauth http://localhost:3000 --verbose
+    """
+    import time
+    from agentsentinel_cli.redteam.mcp_preauth import run_preauth
+    from agentsentinel_cli.redteam.mcp_oauth import run_oauth
+    from agentsentinel_cli.redteam.models import RedTeamResult
+    from agentsentinel_cli.redteam.report import print_redteam_result, as_redteam_json
+
+    if not target:
+        console.print("[red]Error:[/red] provide a URL.")
+        console.print("  Example: [dim]sentinel redteam mcp preauth http://localhost:3000[/dim]")
+        sys.exit(1)
+
+    target = _normalize_url(target)
+    t0 = time.monotonic()
+
+    preauth_findings, preauth_count = run_preauth(url=target, timeout=timeout, verbose=verbose)
+    oauth_findings, oauth_count = run_oauth(
+        url=target, original_headers={}, timeout=timeout, verbose=verbose,
+    )
+    all_findings = preauth_findings + oauth_findings
+
+    result = RedTeamResult(
+        target=target, server_name="unknown", server_version="unknown",
+        transport="http", modules_run=["preauth", "oauth"], findings=all_findings,
+        tool_count=0, attack_count=preauth_count + oauth_count,
+        duration_s=time.monotonic() - t0,
+    )
+
+    if fmt == "json":
+        click.echo(as_redteam_json(result))
+    else:
+        print_redteam_result(result, verbose)
+
+    _save_output(output_path, result)
+    _check_exit(all_findings, fail_on)
+
+
 # ── sentinel redteam mcp auth ─────────────────────────────────────────────────
 
 @redteam_mcp_group.command("auth")
@@ -1216,9 +1276,18 @@ def redteam_mcp_auth(
         timeout=timeout, verbose=verbose,
     )
 
+    # OAuth 2.0 attack surface (HTTP-layer, no session needed)
+    if target and not stdio_cmd:
+        from agentsentinel_cli.redteam.mcp_oauth import run_oauth
+        oauth_findings, oauth_count = run_oauth(
+            url=target, original_headers=headers, timeout=timeout, verbose=verbose,
+        )
+        findings = findings + oauth_findings
+        scenarios_tested += oauth_count
+
     result = RedTeamResult(
         target=display, server_name=server_name, server_version=server_version,
-        transport=transport, modules_run=["auth"], findings=findings,
+        transport=transport, modules_run=["auth", "oauth"], findings=findings,
         tool_count=tool_count, attack_count=scenarios_tested,
         duration_s=time.monotonic() - t0,
     )
@@ -1507,6 +1576,8 @@ def redteam_mcp_full(
     """
     import time
     from agentsentinel_cli.redteam.transport import RedTeamSession
+    from agentsentinel_cli.redteam.mcp_preauth import run_preauth
+    from agentsentinel_cli.redteam.mcp_oauth import run_oauth
     from agentsentinel_cli.redteam.mcp_recon import run_recon
     from agentsentinel_cli.redteam.mcp_auth import run_auth_bypass
     from agentsentinel_cli.redteam.mcp_inject import run_inject
@@ -1529,7 +1600,21 @@ def redteam_mcp_full(
 
     t0 = time.monotonic()
 
-    # ── Phase 1–5: run inside a single persistent session ────────────────────
+    # ── Phase 1–2: HTTP-layer probes — no session or credentials required ────
+    if target and not stdio_cmd:
+        preauth_findings, preauth_count = run_preauth(
+            url=target, timeout=timeout, verbose=verbose,
+        )
+        all_findings.extend(preauth_findings)
+        total_attacks += preauth_count
+
+        oauth_findings, oauth_count = run_oauth(
+            url=target, original_headers=headers, timeout=timeout, verbose=verbose,
+        )
+        all_findings.extend(oauth_findings)
+        total_attacks += oauth_count
+
+    # ── Phase 3–7: run inside a single persistent MCP session ───────────────
     try:
         with RedTeamSession(url=target, stdio_cmd=stdio_cmd,
                             extra_headers=headers, timeout=timeout) as session:
@@ -1554,11 +1639,11 @@ def redteam_mcp_full(
                 transient=True,
             ) as progress:
 
-                task = progress.add_task("Phase 1/5 — recon…", total=None)
+                task = progress.add_task("Phase 3/7 — recon…", total=None)
                 recon_findings, _ = run_recon(session, verbose)
                 all_findings.extend(recon_findings)
 
-                progress.update(task, description="Phase 2/5 — auth bypass…")
+                progress.update(task, description="Phase 4/7 — auth bypass…")
                 auth_findings, auth_scenarios = run_auth_bypass(
                     url=target, stdio_cmd=stdio_cmd,
                     original_headers=headers, timeout=timeout, verbose=verbose,
@@ -1566,10 +1651,9 @@ def redteam_mcp_full(
                 all_findings.extend(auth_findings)
                 total_attacks += auth_scenarios
 
-                progress.update(task, description="Phase 3/5 — injection…")
+                progress.update(task, description="Phase 5/7 — injection…")
                 inject_findings, inject_count = run_inject(
                     session,
-                    # LLM injection is handled by poison phase — no duplication
                     techniques=["traverse", "ssrf", "cmd", "sqli"],
                     intensity=intensity,
                     include_dangerous=include_dangerous,
@@ -1578,30 +1662,34 @@ def redteam_mcp_full(
                 all_findings.extend(inject_findings)
                 total_attacks += inject_count
 
-                progress.update(task, description="Phase 4/5 — poisoning…")
+                progress.update(task, description="Phase 6/7 — poisoning…")
                 poison_findings, poison_count = run_poison(session, verbose)
                 all_findings.extend(poison_findings)
                 total_attacks += poison_count
 
-                progress.update(task, description="Phase 5/5 — fuzzing…")
+                progress.update(task, description="Phase 7/7 — fuzzing…")
                 fuzz_findings, fuzz_count = run_fuzz(session, verbose)
                 all_findings.extend(fuzz_findings)
                 total_attacks += fuzz_count
 
     except McpAuthRequired as exc:
         console.print(f"\n[bold yellow]Auth required[/bold yellow] (HTTP {exc.status_code})")
+        console.print("  Preauth + OAuth findings above are still valid without a token.")
         console.print("  Use: [bold]--auth-header 'Authorization: Bearer <token>'[/bold]")
-        sys.exit(1)
+        if not all_findings:
+            sys.exit(1)
+        # Fall through — report whatever preauth/oauth found
     except McpError as exc:
         console.print(f"\n[red]Connection failed:[/red] {exc}")
-        sys.exit(1)
+        if not all_findings:
+            sys.exit(1)
 
     result = RedTeamResult(
         target=display,
         server_name=server_name,
         server_version=server_version,
         transport=transport,
-        modules_run=["recon", "auth", "inject", "poison", "fuzz"],
+        modules_run=["preauth", "oauth", "recon", "auth", "inject", "poison", "fuzz"],
         findings=all_findings,
         tool_count=tool_count,
         attack_count=total_attacks,
