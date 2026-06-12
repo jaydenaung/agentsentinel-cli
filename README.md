@@ -223,7 +223,7 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 - **VS Code** — `mcp.servers` in `settings.json` (MCP support added in VS Code 1.99)
 
 *Host security*
-- **Shell configs** — hardcoded AI API keys in `.zshrc`, `.bashrc`, `.zprofile`, etc.
+- **Shell configs** — hardcoded AI API keys in `.zshrc`, `.bashrc`, `.zprofile`, etc. (macOS/Linux); PowerShell profiles on Windows
 - **macOS TCC permissions** — Full Disk Access, Screen Recording, Accessibility granted to AI apps
 - **macOS system security** — SIP, FileVault, Gatekeeper status
 - **Exposed AI processes** — AI-related processes listening on non-localhost interfaces
