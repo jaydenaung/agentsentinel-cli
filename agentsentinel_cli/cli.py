@@ -202,13 +202,7 @@ def discover(
     port_list = _parse_ports(ports) if ports else None
 
     # Parse auth header
-    extra_headers: dict[str, str] = {}
-    if auth_header:
-        if ":" not in auth_header:
-            console.print("[red]Error:[/red] --auth-header must be 'Header-Name: value' format.")
-            sys.exit(1)
-        key, _, val = auth_header.partition(":")
-        extra_headers[key.strip()] = val.strip()
+    extra_headers = _parse_auth_header(auth_header)
 
     # --host: single-host scan — bypass run_discovery and call scan_network directly
     if host:
@@ -339,14 +333,7 @@ def mcp_scan(
 
     display_target = stdio_cmd if stdio_cmd else target
 
-    extra_headers: dict[str, str] = {}
-    if auth_header:
-        if ":" not in auth_header:
-            console.print("[red]Error:[/red] --auth-header must be in 'Header-Name: value' format.")
-            sys.exit(1)
-        key, _, val = auth_header.partition(":")
-        extra_headers[key.strip()] = val.strip()
-
+    extra_headers = _parse_auth_header(auth_header)
     auth_required = bool(auth_header)
 
     try:
@@ -440,13 +427,7 @@ def inspect(
     api_key = "" if skip_ai else os.environ.get("ANTHROPIC_API_KEY", "")
 
     if target.startswith("http://") or target.startswith("https://"):
-        extra_headers: dict[str, str] = {}
-        if auth_header:
-            if ":" not in auth_header:
-                console.print("[red]Error:[/red] --auth-header must be 'Header-Name: value' format.")
-                sys.exit(1)
-            k, _, v = auth_header.partition(":")
-            extra_headers[k.strip()] = v.strip()
+        extra_headers = _parse_auth_header(auth_header)
 
         report = inspect_live(
             target,
@@ -685,13 +666,7 @@ def supply_chain(
 
     display_target = stdio_cmd if stdio_cmd else target
 
-    extra_headers: dict[str, str] = {}
-    if auth_header:
-        if ":" not in auth_header:
-            console.print("[red]Error:[/red] --auth-header must be in 'Header-Name: value' format.")
-            sys.exit(1)
-        key, _, val = auth_header.partition(":")
-        extra_headers[key.strip()] = val.strip()
+    extra_headers = _parse_auth_header(auth_header)
 
     # ── Connect to MCP server ─────────────────────────────────────────────────
     try:
@@ -1046,11 +1021,33 @@ def _add_mcp_common(cmd: click.BaseCommand) -> click.BaseCommand:
 def _parse_auth_header(auth_header: str | None) -> dict[str, str]:
     if not auth_header:
         return {}
-    if ":" not in auth_header:
-        console.print("[red]Error:[/red] --auth-header must be 'Header-Name: value' format.")
+    stripped = auth_header.strip()
+    if ":" not in stripped:
+        if stripped.lower().startswith("bearer "):
+            console.print(
+                "[red]Error:[/red] --auth-header is missing the header name.\n"
+                "  You provided a raw token — wrap it in a header:\n"
+                "  [bold]--auth-header 'Authorization: Bearer <token>'[/bold]"
+            )
+        else:
+            console.print(
+                "[red]Error:[/red] --auth-header must be [bold]'Header-Name: value'[/bold] format.\n"
+                "  Example: [dim]--auth-header 'Authorization: Bearer eyJ...'[/dim]"
+            )
         sys.exit(1)
-    key, _, val = auth_header.partition(":")
-    return {key.strip(): val.strip()}
+    key, _, val = stripped.partition(":")
+    key = key.strip()
+    if " " in key or "\t" in key:
+        console.print(
+            f"[red]Error:[/red] Invalid header name [bold]{key!r}[/bold] — header names cannot contain spaces.\n"
+            "  Did you mean:  [bold]--auth-header 'Authorization: Bearer <token>'[/bold]\n"
+            "  Not:           [dim]--auth-header 'Bearer Token: <secret>'[/dim]"
+        )
+        sys.exit(1)
+    if not key:
+        console.print("[red]Error:[/red] --auth-header has an empty header name before ':'.")
+        sys.exit(1)
+    return {key: val.strip()}
 
 
 def _require_target(target: str | None, stdio_cmd: str | None) -> None:
