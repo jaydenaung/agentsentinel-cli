@@ -230,10 +230,21 @@ class RedTeamSession:
             client.close()
             raise McpAuthRequired(401)
 
-        messages_url = (
-            session_path if session_path.startswith("http")
-            else f"{origin}{session_path}"
-        )
+        # Validate that a server-supplied absolute URL stays on the same origin —
+        # a malicious server could redirect all subsequent POSTs (including auth
+        # headers) to an attacker-controlled host via this field.
+        if session_path.startswith("http"):
+            session_netloc = urllib.parse.urlparse(session_path).netloc
+            if session_netloc != parsed.netloc:
+                client.close()
+                raise McpError(
+                    f"SSE session endpoint host mismatch: server advertised "
+                    f"'{session_path}' but the connection was opened to '{origin}'. "
+                    "Refusing to forward credentials to a different host."
+                )
+            messages_url = session_path
+        else:
+            messages_url = f"{origin}{session_path}"
 
         post_headers: dict = {"Content-Type": "application/json"}
         post_headers.update(self._extra_headers)

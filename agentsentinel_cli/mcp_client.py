@@ -223,8 +223,18 @@ def scan_sse(
         if session_path is None:
             raise McpAuthRequired(401)
 
-        # Build the absolute messages URL
+        # Build the absolute messages URL.
+        # Validate that a server-supplied absolute URL stays on the same origin —
+        # a malicious server could redirect all subsequent POSTs (including auth
+        # headers) to an attacker-controlled host via this field.
         if session_path.startswith("http"):
+            session_netloc = urllib.parse.urlparse(session_path).netloc
+            if session_netloc != parsed.netloc:
+                raise McpError(
+                    f"SSE session endpoint host mismatch: server advertised "
+                    f"'{session_path}' but the connection was opened to '{origin}'. "
+                    "Refusing to forward credentials to a different host."
+                )
             messages_url = session_path
         else:
             messages_url = f"{origin}{session_path}"

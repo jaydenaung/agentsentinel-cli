@@ -109,7 +109,7 @@ def run_oauth(
         # Tests that benefit from a valid token
         has_token = "Authorization" in original_headers
         if has_token:
-            probes += _test_scope_escalation(client, url, original_headers, meta, findings, verbose)
+            probes += _test_scope_escalation(client, url, original_headers, meta, as_origin, findings, verbose)
             probes += _test_agent_scope_forgery(client, url, original_headers, findings, verbose)
 
     return findings, probes
@@ -428,6 +428,7 @@ def _test_scope_escalation(
     url: str,
     original_headers: dict,
     meta: dict,
+    as_origin: str,
     findings: list[RedTeamFinding],
     verbose: bool,
 ) -> int:
@@ -442,6 +443,41 @@ def _test_scope_escalation(
     orig_auth = original_headers.get("Authorization", "")
     if not orig_auth.startswith("Bearer "):
         return 0
+
+    # Refuse to forward the caller's real Bearer token to a token_endpoint
+    # that is on a different host from the AS we discovered. A malicious AS
+    # metadata document could point token_endpoint at an attacker-controlled
+    # server to exfiltrate the credential.
+    token_ep_netloc = urllib.parse.urlparse(token_endpoint).netloc
+    as_netloc = urllib.parse.urlparse(as_origin).netloc
+    if token_ep_netloc != as_netloc:
+        findings.append(RedTeamFinding(
+            attack_type="oauth",
+            severity="HIGH",
+            title="OAuth: token_endpoint on unexpected external host — credential exfiltration risk",
+            tool_name="<auth-server>",
+            parameter=None,
+            payload=f"token_endpoint={token_endpoint}",
+            evidence=(
+                f"The token_endpoint advertised in AS metadata ({token_endpoint}) "
+                f"is on a different host from the authorization server ({as_origin}). "
+                "Scope escalation probe skipped to protect the caller's Bearer token."
+            ),
+            exploit_scenario=(
+                "An adversarial MCP server (or compromised AS metadata) advertises a "
+                "token_endpoint on an attacker-controlled host. Any client that POSTs "
+                "a refresh/scope-escalation request to that endpoint — including its "
+                "Authorization: Bearer header — hands the production token to the attacker."
+            ),
+            mitre_id="T1078.004",
+            owasp_id="ASI06",
+            confidence="HIGH",
+            remediation=(
+                "Ensure the token_endpoint hostname matches the authorization server's "
+                "origin. Reject or warn on cross-origin token endpoints before sending credentials."
+            ),
+        ))
+        return 1
 
     # All supported scopes — attempt to get all of them
     all_scopes = meta.get("scopes_supported", [])
