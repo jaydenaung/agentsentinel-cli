@@ -389,13 +389,39 @@ def _test_pkce_downgrade(
     }
 
     try:
-        resp = client.get(auth_endpoint, params=params)
+        # Do NOT follow redirects — we need to inspect the redirect target to
+        # distinguish "accepted, proceed to login" (true positive) from "rejected
+        # due to unknown client_id" (false positive). With follow_redirects=True
+        # both cases land on a 200 page and are indistinguishable.
+        resp = client.get(auth_endpoint, params=params, follow_redirects=False)
     except Exception:
         return 1
 
-    # 302 redirect to login page = server accepted the request (not rejected the method)
-    # 400 with error=invalid_request = server rejected plain method
-    if resp.status_code in (200, 302):
+    # Determine acceptance vs rejection:
+    #   302 with Location NOT containing error= → AS accepted the request and
+    #     redirected to login or consent — plain PKCE was not rejected.
+    #   302 with error= in Location → AS rejected (e.g. unknown client_id) before
+    #     evaluating PKCE method — this is not a PKCE finding.
+    #   200 → AS rendered a form or code directly — check body for error markers.
+    #   400/401 → AS rejected the method explicitly — no finding.
+    accepted = False
+    evidence_detail = f"HTTP {resp.status_code}"
+
+    if resp.status_code == 302:
+        location = resp.headers.get("location", "")
+        if "error=" not in location:
+            accepted = True
+            evidence_detail = f"HTTP 302 → {location[:120]}"
+    elif resp.status_code == 200:
+        body = resp.text[:800]
+        error_markers = ('"error"', "'error'", "error=", "error_description",
+                         "invalid_client", "unauthorized_client", "access_denied",
+                         "invalid_request")
+        if not any(m in body for m in error_markers):
+            accepted = True
+            evidence_detail = f"HTTP 200 — response contains no error indicators"
+
+    if accepted:
         findings.append(RedTeamFinding(
             attack_type="oauth",
             severity="MEDIUM",
@@ -403,7 +429,7 @@ def _test_pkce_downgrade(
             tool_name="<auth-server>",
             parameter=None,
             payload=f"GET {auth_endpoint} (code_challenge_method=plain)",
-            evidence=f"HTTP {resp.status_code} — server accepted plain PKCE challenge method",
+            evidence=f"{evidence_detail} — server accepted plain PKCE challenge method",
             exploit_scenario=(
                 "The authorization server accepts PKCE with `method=plain`, meaning the code "
                 "verifier is transmitted in cleartext during token exchange. An attacker with "
@@ -534,6 +560,47 @@ def _test_scope_escalation(
                 "the original grant. Validate requested scopes against the original authorization."
             ),
         ))
+    else:
+        # The AS rejected the probe refresh token (expected for well-configured production AS
+        # that validates refresh tokens). This does not mean scope escalation is impossible —
+        # it means the test requires a real refresh token to complete. Emit an INFO finding
+        # so the operator knows the test ran but could not verify the outcome.
+        try:
+            error_code = resp.json().get("error", "")
+        except Exception:
+            error_code = ""
+
+        skip_reasons = ("invalid_grant", "unsupported_grant_type", "invalid_client")
+        if any(r in error_code for r in skip_reasons):
+            findings.append(RedTeamFinding(
+                attack_type="oauth",
+                severity="INFO",
+                title="OAuth: scope escalation test skipped — AS requires a valid refresh token",
+                tool_name="<auth-server>",
+                parameter=None,
+                payload=f"POST {token_endpoint} (grant_type=refresh_token, scope={broad_scope[:60]})",
+                evidence=(
+                    f"HTTP {resp.status_code}  error={error_code}\n"
+                    "The AS correctly rejected the probe refresh token. To test scope escalation "
+                    "fully, provide a real refresh token via --auth-header or re-test manually:\n"
+                    f"  POST {token_endpoint}\n"
+                    f"  grant_type=refresh_token&refresh_token=<real_token>&scope={broad_scope[:80]}"
+                ),
+                exploit_scenario=(
+                    "Scope escalation via refresh_token grant could not be automatically verified "
+                    "because the AS validates refresh token authenticity. Manual testing with a "
+                    "real refresh token is needed to confirm whether the AS enforces scope "
+                    "downscoping on token renewal."
+                ),
+                mitre_id="T1078.004",
+                owasp_id="ASI06",
+                confidence="HIGH",
+                remediation=(
+                    "Ensure the token endpoint enforces scope downscoping: never issue a renewed "
+                    "token with broader scopes than the original grant. Validate requested scopes "
+                    "against the original authorization record."
+                ),
+            ))
 
     return 1
 
