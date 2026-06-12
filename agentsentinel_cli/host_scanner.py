@@ -207,22 +207,22 @@ def _scan_memory_files() -> tuple[int, int]:
 
 _AI_KEY_PATTERNS: list[tuple[str, re.Pattern]] = [
     ("ANTHROPIC_API_KEY", re.compile(
-        r'(?:export\s+)?ANTHROPIC_API_KEY\s*=\s*["\']?(sk-ant-[A-Za-z0-9\-_]{20,})["\']?'
+        r'(?:export\s+|\$env:[A-Z_]+=|setx\s+\S+\s+)?ANTHROPIC_API_KEY\s*[=:]\s*["\']?(sk-ant-[A-Za-z0-9\-_]{20,})["\']?'
     )),
     ("OPENAI_API_KEY", re.compile(
-        r'(?:export\s+)?OPENAI_API_KEY\s*=\s*["\']?(sk-(?:proj-)?[A-Za-z0-9\-_]{20,})["\']?'
+        r'(?:export\s+|\$env:[A-Z_]+=|setx\s+\S+\s+)?OPENAI_API_KEY\s*[=:]\s*["\']?(sk-(?:proj-)?[A-Za-z0-9\-_]{20,})["\']?'
     )),
     ("GOOGLE_API_KEY", re.compile(
-        r'(?:export\s+)?(?:GOOGLE_API_KEY|GEMINI_API_KEY)\s*=\s*["\']?([A-Za-z0-9\-_]{30,})["\']?'
+        r'(?:export\s+|\$env:[A-Z_]+=|setx\s+\S+\s+)?(?:GOOGLE_API_KEY|GEMINI_API_KEY)\s*[=:]\s*["\']?([A-Za-z0-9\-_]{30,})["\']?'
     )),
     ("HF_TOKEN", re.compile(
-        r'(?:export\s+)?(?:HF_TOKEN|HUGGINGFACE_TOKEN)\s*=\s*["\']?(hf_[A-Za-z0-9]{20,})["\']?'
+        r'(?:export\s+|\$env:[A-Z_]+=|setx\s+\S+\s+)?(?:HF_TOKEN|HUGGINGFACE_TOKEN)\s*[=:]\s*["\']?(hf_[A-Za-z0-9]{20,})["\']?'
     )),
     ("MISTRAL_API_KEY", re.compile(
-        r'(?:export\s+)?MISTRAL_API_KEY\s*=\s*["\']?([A-Za-z0-9]{30,})["\']?'
+        r'(?:export\s+|\$env:[A-Z_]+=|setx\s+\S+\s+)?MISTRAL_API_KEY\s*[=:]\s*["\']?([A-Za-z0-9]{30,})["\']?'
     )),
     ("COHERE_API_KEY", re.compile(
-        r'(?:export\s+)?(?:COHERE_API_KEY|CO_API_KEY)\s*=\s*["\']?([A-Za-z0-9\-_]{30,})["\']?'
+        r'(?:export\s+|\$env:[A-Z_]+=|setx\s+\S+\s+)?(?:COHERE_API_KEY|CO_API_KEY)\s*[=:]\s*["\']?([A-Za-z0-9\-_]{30,})["\']?'
     )),
 ]
 
@@ -230,6 +230,16 @@ _SHELL_CONFIG_FILES = [
     "~/.zshrc", "~/.bashrc", "~/.bash_profile", "~/.zprofile",
     "~/.profile", "~/.zshenv", "~/.bash_aliases",
 ]
+
+# PowerShell profile paths on Windows — checked when the platform is Windows
+_POWERSHELL_PROFILE_PATHS: list[Path] = []
+if os.name == "nt":
+    _documents = Path.home() / "Documents"
+    _POWERSHELL_PROFILE_PATHS = [
+        _documents / "PowerShell" / "Microsoft.PowerShell_profile.ps1",         # PS 7+
+        _documents / "WindowsPowerShell" / "Microsoft.PowerShell_profile.ps1",  # PS 5
+        Path.home() / "AppData" / "Local" / "PowerShell" / "Microsoft.PowerShell_profile.ps1",
+    ]
 
 
 def _scan_shell_configs() -> list[tuple[str, str, str]]:
@@ -253,6 +263,24 @@ def _scan_shell_configs() -> list[tuple[str, str, str]]:
                 seen.add((key_type, val[:8]))
                 redacted = val[:8] + "****" + val[-4:] if len(val) > 12 else "****"
                 findings.append((key_type, str(p), redacted))
+
+    # Windows: check PowerShell profile files
+    for ps_path in _POWERSHELL_PROFILE_PATHS:
+        if not ps_path.exists():
+            continue
+        try:
+            content = ps_path.read_text(errors="replace")
+        except OSError:
+            continue
+        for key_type, pattern in _AI_KEY_PATTERNS:
+            for m in pattern.finditer(content):
+                val = m.group(1)
+                if (key_type, val[:8]) in seen:
+                    continue
+                seen.add((key_type, val[:8]))
+                redacted = val[:8] + "****" + val[-4:] if len(val) > 12 else "****"
+                findings.append((key_type, str(ps_path), redacted))
+
     return findings
 
 
