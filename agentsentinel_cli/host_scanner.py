@@ -65,6 +65,15 @@ class ExposedProcess:
 
 
 @dataclasses.dataclass
+class WindowsPermissionSignal:
+    """Windows analog to macOS TCC — Defender exclusions and NTFS ACLs on Claude paths."""
+    check: str            # "defender_exclusion" | "acl_world_writable"
+    path: str
+    risky: bool
+    detail: str
+
+
+@dataclasses.dataclass
 class HostContext:
     """Aggregated host AI security posture data — passed to every rule."""
     claude_code: ClaudeCodeSettings | None
@@ -78,6 +87,7 @@ class HostContext:
     filevault_enabled: bool | None
     gatekeeper_enabled: bool | None
     exposed_processes: list[ExposedProcess]
+    windows_permissions: list[WindowsPermissionSignal]
     scan_errors: list[str]
 
 
@@ -428,6 +438,74 @@ def _scan_exposed_processes() -> list[ExposedProcess]:
     return exposed
 
 
+# ── Windows permission signals (TCC-equivalent) ────────────────────────────────
+
+def _windows_claude_paths() -> list[Path]:
+    home = Path.home()
+    appdata = Path(os.environ["APPDATA"]) if "APPDATA" in os.environ else None
+    paths = [home / ".claude"]
+    if appdata:
+        paths.append(appdata / "Claude")
+    return [p for p in paths if p.exists()]
+
+
+def _check_defender_exclusions(claude_paths: list[Path]) -> list[WindowsPermissionSignal]:
+    out = _run_cmd([
+        "powershell", "-NoProfile", "-Command",
+        "Get-MpPreference | Select-Object -ExpandProperty ExclusionPath",
+    ], timeout=8)
+    if out is None:
+        return []
+    excluded = {line.strip().lower() for line in out.splitlines() if line.strip()}
+    signals = []
+    for p in claude_paths:
+        p_str = str(p).lower()
+        hit = any(p_str.startswith(e) or e.startswith(p_str) for e in excluded)
+        if hit:
+            signals.append(WindowsPermissionSignal(
+                check="defender_exclusion",
+                path=str(p),
+                risky=True,
+                detail=f"{p} is excluded from Windows Defender scanning",
+            ))
+    return signals
+
+
+def _check_acl_world_writable(claude_paths: list[Path]) -> list[WindowsPermissionSignal]:
+    signals = []
+    for p in claude_paths:
+        out = _run_cmd(["icacls", str(p)], timeout=8)
+        if out is None:
+            continue
+        lower = out.lower()
+        risky_principals = []
+        for principal in ("everyone", "builtin\\users", "authenticated users"):
+            if principal in lower and any(
+                f"{principal}:(" in lower and perm in lower
+                for perm in ("(f)", "(m)", "(w)")
+            ):
+                risky_principals.append(principal)
+        if risky_principals:
+            signals.append(WindowsPermissionSignal(
+                check="acl_world_writable",
+                path=str(p),
+                risky=True,
+                detail=f"{p} is writable by: {', '.join(risky_principals)}",
+            ))
+    return signals
+
+
+def _scan_windows_permissions() -> list[WindowsPermissionSignal]:
+    """Best-effort TCC-equivalent for Windows: Defender exclusions + NTFS ACLs on
+    Claude config/memory paths. No-op on non-Windows platforms."""
+    if os.name != "nt":
+        return []
+    claude_paths = _windows_claude_paths()
+    if not claude_paths:
+        return []
+    return _check_defender_exclusions(claude_paths) + _check_acl_world_writable(claude_paths)
+
+
 # ── Third-party AI tool configs ───────────────────────────────────────────────
 
 def _dig(data: object, keys: list[str]) -> object:
@@ -547,5 +625,6 @@ def scan_host() -> HostContext:
         filevault_enabled=_check_filevault(),
         gatekeeper_enabled=_check_gatekeeper(),
         exposed_processes=_scan_exposed_processes(),
+        windows_permissions=_scan_windows_permissions(),
         scan_errors=errors,
     )

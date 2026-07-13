@@ -207,6 +207,7 @@ sentinel host-scan
 sentinel host-scan --format json
 sentinel host-scan --fail-on HIGH
 sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
+sentinel host-scan --baseline
 ```
 
 **What it checks:**
@@ -226,8 +227,13 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 - **Shell configs** — hardcoded AI API keys in `.zshrc`, `.bashrc`, `.zprofile`, etc. (macOS/Linux); PowerShell profiles on Windows
 - **macOS TCC permissions** — Full Disk Access, Screen Recording, Accessibility granted to AI apps
 - **macOS system security** — SIP, FileVault, Gatekeeper status
+- **Windows permission signals** — Defender exclusions and NTFS ACLs on `~/.claude` / Claude Desktop config (best-effort TCC equivalent)
 - **Exposed AI processes** — AI-related processes listening on non-localhost interfaces
 - **Memory footprint** — Claude Code conversation memory size in `~/.claude/projects/`
+
+**`--baseline`** — recommended configuration and gap analysis
+
+Adds a "Recommended Configuration Gaps" report comparing your current Claude Code / Claude Desktop settings against a single opinionated secure baseline: no shell tools in `allowedTools`, explicit `disallowedTools` denies for destructive patterns (`rm -rf`, `git push --force`, `sudo`), MCP servers scoped to project directories (not home/root), no filesystem+network combos on the same MCP server, and hooks flagged for manual review. Each gap includes the concrete risk and a fix, plus a pasteable `~/.claude/settings.json` snippet with the suggested `allowedTools`/`disallowedTools`. JSON output adds `posture_gaps` and `recommended_settings_snippet` keys.
 
 **Rules:**
 
@@ -247,6 +253,8 @@ sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
 | `HOST_MCP_SENSITIVE_PATH` | MEDIUM | config | Any AI tool's MCP server has access to `~/.ssh`, `~/.aws`, `~/.kube`, or Keychain |
 | `HOST_MANY_MCP_SERVERS` | MEDIUM | config | 8+ MCP servers across all detected AI tools — large prompt injection attack surface |
 | `HOST_GATEKEEPER_OFF` | MEDIUM | system | Gatekeeper disabled — unsigned binaries run without warning |
+| `HOST_WINDOWS_ACL_WORLD_WRITABLE` | MEDIUM | permissions | Claude config/memory directory writable by Everyone or all local users (Windows) |
+| `HOST_DEFENDER_EXCLUSION_CLAUDE` | HIGH | system | Windows Defender excludes a Claude config/memory path from scanning |
 | `HOST_LARGE_MEMORY` | LOW | data_exposure | Claude Code memory files exceed 50 MB of accumulated conversation data |
 
 Every finding includes a remediation step. The posture score (0–100) uses CRITICAL −40, HIGH −20, MEDIUM −10, LOW −5.

@@ -429,6 +429,52 @@ def _rule_gatekeeper_off(ctx: HostContext) -> HostFinding | None:
     )
 
 
+def _rule_defender_exclusion_claude(ctx: HostContext) -> HostFinding | None:
+    """HIGH: Windows Defender excludes a Claude config/memory path from scanning."""
+    hits = [s for s in ctx.windows_permissions if s.check == "defender_exclusion" and s.risky]
+    if not hits:
+        return None
+    paths = ", ".join(s.path for s in hits)
+    return HostFinding(
+        severity="HIGH",
+        rule_id="HOST_DEFENDER_EXCLUSION_CLAUDE",
+        category="system",
+        message=(
+            "Windows Defender is configured to skip scanning a Claude config or "
+            "memory directory. Malicious payloads dropped by a compromised MCP "
+            "server or written via prompt injection would not be scanned."
+        ),
+        detail=f"Excluded paths: {paths}",
+        remediation=(
+            "Remove the Claude path from Windows Security → Virus & threat protection → "
+            "Exclusions, unless a specific false-positive requires it."
+        ),
+    )
+
+
+def _rule_windows_acl_world_writable(ctx: HostContext) -> HostFinding | None:
+    """MEDIUM: Claude config/memory directory is writable by all local users on Windows."""
+    hits = [s for s in ctx.windows_permissions if s.check == "acl_world_writable" and s.risky]
+    if not hits:
+        return None
+    detail = "; ".join(s.detail for s in hits)
+    return HostFinding(
+        severity="MEDIUM",
+        rule_id="HOST_WINDOWS_ACL_WORLD_WRITABLE",
+        category="permissions",
+        message=(
+            "A Claude config or memory directory has write permissions for all "
+            "local users or Everyone. Any other account or process on this "
+            "machine can tamper with Claude's configuration or read its memory files."
+        ),
+        detail=detail,
+        remediation=(
+            "Restrict NTFS permissions on the Claude config directory to your "
+            "user account: icacls <path> /remove Everyone /remove \"BUILTIN\\Users\"."
+        ),
+    )
+
+
 def _rule_large_memory(ctx: HostContext) -> HostFinding | None:
     """LOW: large conversation memory files accumulate sensitive data over time."""
     _MB = 1024 * 1024
@@ -467,6 +513,7 @@ _ALL_RULES = [
     _rule_screen_recording,
     _rule_ai_process_exposed,
     _rule_filevault_off,
+    _rule_defender_exclusion_claude,
     # MEDIUM
     _rule_accessibility,
     _rule_hooks_shell,
@@ -474,6 +521,7 @@ _ALL_RULES = [
     _rule_sensitive_path,
     _rule_many_mcp_servers,
     _rule_gatekeeper_off,
+    _rule_windows_acl_world_writable,
     # LOW
     _rule_large_memory,
 ]

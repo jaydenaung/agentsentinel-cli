@@ -53,7 +53,40 @@ def _bool_tag(val: bool | None, true_label: str, false_label: str) -> str:
     return "[dim]unknown[/dim]"
 
 
-def print_host_result(ctx: HostContext, findings: list[HostFinding], score: int) -> None:
+def _print_posture_gaps(gaps: list, snippet: dict | None) -> None:
+    """Render the recommended-configuration gap table and suggested settings snippet."""
+    console.rule("[dim]Recommended Configuration Gaps[/dim]", style="dim")
+    if not gaps:
+        console.print("  [green]✓ Current Claude config matches the recommended baseline[/green]\n")
+        return
+
+    tbl = Table(box=box.SIMPLE, show_header=True, header_style="dim", padding=(0, 1))
+    tbl.add_column("Setting", style="bold white", min_width=16)
+    tbl.add_column("Current", style="yellow", max_width=30)
+    tbl.add_column("Recommended", style="green", max_width=30)
+    tbl.add_column("Risk", style="dim", max_width=44)
+
+    for g in gaps:
+        tbl.add_row(g.description, g.current, g.recommended, g.risk)
+    console.print(tbl)
+
+    for g in gaps:
+        console.print(f"  [dim cyan]→ {g.description}: {g.fix}[/dim cyan]")
+
+    if snippet:
+        console.print()
+        console.print("  [bold white]Suggested ~/.claude/settings.json changes:[/bold white]")
+        console.print(json.dumps(snippet, indent=2))
+    console.print()
+
+
+def print_host_result(
+    ctx: HostContext,
+    findings: list[HostFinding],
+    score: int,
+    gaps: list | None = None,
+    snippet: dict | None = None,
+) -> None:
     """Render the full host posture report to the terminal."""
     status = _status_label(score)
     status_color = _STATUS_COLOR[status]
@@ -192,6 +225,10 @@ def print_host_result(ctx: HostContext, findings: list[HostFinding], score: int)
     else:
         console.print("  [green]✓ No security findings[/green]\n")
 
+    # ── Recommended configuration gaps (--baseline) ─────────────────────────────
+    if gaps is not None:
+        _print_posture_gaps(gaps, snippet)
+
     # ── Footer ────────────────────────────────────────────────────────────────
     bar_filled = int(score / 5)
     bar = "█" * bar_filled + "░" * (20 - bar_filled)
@@ -215,7 +252,13 @@ def print_host_result(ctx: HostContext, findings: list[HostFinding], score: int)
     console.print()
 
 
-def as_host_json(ctx: HostContext, findings: list[HostFinding], score: int) -> str:
+def as_host_json(
+    ctx: HostContext,
+    findings: list[HostFinding],
+    score: int,
+    gaps: list | None = None,
+    snippet: dict | None = None,
+) -> str:
     """Serialize host posture results as JSON."""
     all_mcp: list[dict] = []
     if ctx.claude_code:
@@ -292,7 +335,23 @@ def as_host_json(ctx: HostContext, findings: list[HostFinding], score: int) -> s
             }
             for f in findings
         ],
+        "windows_permissions": [
+            {"check": s.check, "path": s.path, "risky": s.risky, "detail": s.detail}
+            for s in ctx.windows_permissions
+        ],
         "posture_score": score,
         "status": _status_label(score),
         "scan_errors": ctx.scan_errors,
+        "posture_gaps": [
+            {
+                "key": g.key,
+                "description": g.description,
+                "current": g.current,
+                "recommended": g.recommended,
+                "risk": g.risk,
+                "fix": g.fix,
+            }
+            for g in gaps
+        ] if gaps is not None else [],
+        "recommended_settings_snippet": snippet if snippet is not None else {},
     }, indent=2)

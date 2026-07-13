@@ -848,17 +848,21 @@ def a2a(
               default=None, help="Exit with code 1 if findings at or above this severity exist.")
 @click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
               help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
+@click.option("--baseline", is_flag=True, default=False,
+              help="Show recommended Claude Code/Desktop config and the gap vs. current settings.")
 def host(
     fmt: str,
     fail_on: str | None,
     ignore_rules: tuple[str, ...],
+    baseline: bool,
 ) -> None:
     """Audit your local AI security posture.
 
     Checks Claude Code and Desktop configurations, MCP server permissions,
     shell credential exposure, macOS privacy permissions (Full Disk Access,
-    Screen Recording, Accessibility), system security (SIP, FileVault,
-    Gatekeeper), and AI processes exposed on the network.
+    Screen Recording, Accessibility), Windows Defender/ACL signals, system
+    security (SIP, FileVault, Gatekeeper), and AI processes exposed on the
+    network.
 
     No network calls — all checks are local and read-only.
 
@@ -868,6 +872,7 @@ def host(
         sentinel host-scan --format json
         sentinel host-scan --fail-on HIGH
         sentinel host-scan --ignore-rule HOST_LARGE_MEMORY
+        sentinel host-scan --baseline
     """
     from agentsentinel_cli.host_scanner import scan_host
     from agentsentinel_cli.host_rules import run_host_rules, host_posture_score
@@ -894,10 +899,16 @@ def host(
     findings, suppressed = _suppress.apply(findings, sup_rules)
     score = host_posture_score(findings)
 
+    gaps, snippet = None, None
+    if baseline:
+        from agentsentinel_cli.posture_baseline import compute_posture_gaps, recommended_settings_snippet
+        gaps = compute_posture_gaps(ctx)
+        snippet = recommended_settings_snippet(ctx)
+
     if fmt == "json":
-        click.echo(as_host_json(ctx, findings, score))
+        click.echo(as_host_json(ctx, findings, score, gaps=gaps, snippet=snippet))
     else:
-        print_host_result(ctx, findings, score)
+        print_host_result(ctx, findings, score, gaps=gaps, snippet=snippet)
         msg = _suppress.notice(suppressed)
         if msg:
             console.print(f"  {msg}\n")
