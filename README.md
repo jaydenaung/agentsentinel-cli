@@ -270,7 +270,7 @@ Every finding includes a remediation step. The posture score (0–100) uses CRIT
 
 Complements `host-scan --baseline`: instead of checking static config, it parses actual session transcripts (`~/.claude/projects/**/*.jsonl`) to report what really happened — which tools ran, which permission mode was active, what got denied, and whether any destructive command was actually executed rather than merely permitted.
 
-No network calls. Local and read-only.
+No network calls. Local and read-only, aside from a parse cache it maintains for itself (see below).
 
 ```bash
 sentinel session-audit
@@ -278,29 +278,37 @@ sentinel session-audit --project ~/code/my-app
 sentinel session-audit --since 7
 sentinel session-audit --all-history --format json
 sentinel session-audit --fail-on HIGH
+sentinel session-audit --no-cache
 ```
 
-By default, scans the 20 most recent sessions across every project. `--project <path>` restricts to one project (matched against the session's recorded working directory, not the on-disk folder name). `--since <days>` scans a time window instead of a session count. `--all-history` scans every transcript on disk.
+By default, scans the 20 most recent sessions across every project. `--project <path>` restricts to one project (matched against the session's recorded working directory, not the on-disk folder name — resolved/normalized on both sides, so symlinks and trailing slashes don't cause silent zero-result mismatches). `--since <days>` scans a time window instead of a session count. `--all-history` scans every transcript on disk.
+
+Parsed transcripts are cached at `~/.agentsentinel/session_cache.json`, keyed on each file's path/mtime/size, so unchanged sessions aren't reparsed on every run — pass `--no-cache` to force a full reparse (e.g. after a sentinel upgrade, in case the parser's classification logic changed).
 
 **What it checks:**
 - **Tool usage per session** — every `Bash`/`Read`/`Write`/`Edit`/etc. call actually made, tallied
 - **Permission-mode switches** — including `bypassPermissions`, where every tool call ran with zero confirmation
-- **Permission denials** — attempts that were blocked, parsed from the transcript's own denial messages
-- **Destructive commands actually executed** — `rm -rf`, `git push --force`, `sudo`, etc., that ran (not just hypothetically allowed by config)
+- **Permission denials** — attempts that were blocked, parsed from the transcript's own denial messages, shown with the actual blocked command/path, not just a count
+- **Destructive commands actually executed** — `rm -rf`, `git push --force`, `sudo`, etc., that ran (not just hypothetically allowed by config). Routine build-artifact cleanup (`rm -rf dist/`, `node_modules/`, a recreated `venv/`, etc., scoped to the project directory) is recognized and excluded — only `rm -rf` targeting an absolute path, the home directory, or a sensitive directory is flagged, and those escalate to CRITICAL
 - **Sensitive-path access** — Read/Write/Edit touching `~/.ssh`, `~/.aws`, Keychain, etc.
-- **Out-of-project writes** — Write/Edit landing outside the session's own project directory
+- **Unscoped sessions** — a session run with its working directory set to the home directory (or filesystem root) instead of a project directory
+- **Out-of-project writes** — Write/Edit landing outside the session's own project directory (cross-platform path containment check — works for POSIX and Windows paths regardless of which OS sentinel itself runs on)
+- **Transcript parsing health** — malformed lines and unrecognized transcript entries (a signal Claude Code's internal format may have changed since this parser was written) are counted and surfaced rather than silently degrading results
 
 **Rules:**
 
 | Rule | Severity | Category | What it catches |
 |------|----------|----------|-----------------|
 | `SESSION_BYPASS_MODE` | HIGH | permissions | A session ran with `bypassPermissions` — no confirmation prompts at all |
-| `SESSION_RISKY_COMMAND_EXECUTED` | HIGH | config | A destructive command (`rm -rf`, `git push --force`, `sudo`) actually ran |
+| `SESSION_RISKY_COMMAND_EXECUTED` | HIGH/CRITICAL | config | A destructive command actually ran — `rm -rf` outside the project (CRITICAL if targeting home/root/a sensitive path), `git push --force`, or `sudo` |
 | `SESSION_SENSITIVE_PATH_TOUCHED` | HIGH | data_exposure | Read/Write/Edit accessed a credential or sensitive directory |
+| `SESSION_UNSCOPED_CWD` | MEDIUM | config | A session ran with its working directory set to the home directory or broader |
 | `SESSION_OUT_OF_PROJECT_WRITE` | MEDIUM | config | Write/Edit landed outside the session's own project directory |
 | `SESSION_HIGH_DENIAL_RATE` | LOW | permissions | A session hit 5+ permission denials — friction or repeated denied attempts |
 
 Same scoring convention as `host-scan`: CRITICAL −40, HIGH −20, MEDIUM −10, LOW −5.
+
+**A known limitation:** detection is text/regex-based over the raw command strings in a transcript, not a real shell parser. A command string that merely *contains* risky-looking text — e.g. inside an embedded script, heredoc, or string literal being printed rather than executed — can still be flagged. Review flagged commands in context rather than treating every hit as confirmed-malicious.
 
 ---
 
