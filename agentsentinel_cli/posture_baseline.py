@@ -9,10 +9,10 @@ reimplementing path/tool-name logic.
 import dataclasses
 
 from agentsentinel_cli.host_rules import (
-    _SHELL_TOOL_NAMES,
     _all_mcp_servers,
     _is_broad_path,
     _is_sensitive_path,
+    _is_unscoped_shell_allow,
 )
 from agentsentinel_cli.host_scanner import HostContext
 
@@ -35,17 +35,17 @@ class PostureGapItem:
 def _gap_shell_tools(ctx: HostContext) -> PostureGapItem | None:
     if not ctx.claude_code:
         return None
-    shell_tools = [t for t in ctx.claude_code.allowed_tools if t.lower() in _SHELL_TOOL_NAMES]
+    shell_tools = [t for t in ctx.claude_code.allowed_tools if _is_unscoped_shell_allow(t)]
     if not shell_tools:
         return None
     return PostureGapItem(
-        key="allowedTools.shell",
-        description="Shell tools in allowedTools",
+        key="permissions.allow.shell",
+        description="Unscoped Bash allow rule",
         current=", ".join(shell_tools),
-        recommended="(none)",
+        recommended="scoped patterns only, e.g. Bash(git status), Bash(npm run *)",
         risk="Bash runs without confirmation — a prompt injection or compromised "
              "MCP server can execute arbitrary OS commands silently.",
-        fix="Remove shell tools from allowedTools in ~/.claude/settings.json.",
+        fix="Replace the unscoped Bash rule in permissions.allow with specific command patterns.",
     )
 
 
@@ -108,14 +108,14 @@ def _gap_disallowed_destructive(ctx: HostContext) -> PostureGapItem | None:
     if not missing:
         return None
     return PostureGapItem(
-        key="disallowedTools.destructive",
+        key="permissions.deny.destructive",
         description="Destructive command patterns not explicitly denied",
         current=", ".join(ctx.claude_code.disallowed_tools) or "(empty)",
         recommended=f"deny patterns for: {', '.join(_DESTRUCTIVE_PATTERNS)}",
         risk="Without an explicit deny, a confused or prompt-injected session "
              "can run destructive commands (force-push, recursive delete, sudo) "
              "as long as the confirmation prompt is accepted.",
-        fix="Add deny entries to disallowedTools in ~/.claude/settings.json "
+        fix="Add deny entries to permissions.deny in ~/.claude/settings.json "
              "for rm -rf, git push --force, and sudo.",
     )
 
@@ -177,12 +177,12 @@ def compute_posture_gaps(ctx: HostContext) -> list[PostureGapItem]:
 
 
 def recommended_settings_snippet(ctx: HostContext) -> dict | None:
-    """Suggested allowedTools/disallowedTools for ~/.claude/settings.json, or None if
+    """Suggested permissions.allow/deny for ~/.claude/settings.json, or None if
     no Claude Code config was found or nothing needs to change."""
     if not ctx.claude_code:
         return None
 
-    allowed = [t for t in ctx.claude_code.allowed_tools if t.lower() not in _SHELL_TOOL_NAMES]
+    allowed = [t for t in ctx.claude_code.allowed_tools if not _is_unscoped_shell_allow(t)]
     disallowed_str = " ".join(ctx.claude_code.disallowed_tools).lower()
     missing_patterns = [p for p in _DESTRUCTIVE_PATTERNS if p not in disallowed_str]
     disallowed = list(ctx.claude_code.disallowed_tools) + [
@@ -192,4 +192,4 @@ def recommended_settings_snippet(ctx: HostContext) -> dict | None:
     if allowed == ctx.claude_code.allowed_tools and not missing_patterns:
         return None
 
-    return {"allowedTools": allowed, "disallowedTools": disallowed}
+    return {"permissions": {"allow": allowed, "deny": disallowed}}

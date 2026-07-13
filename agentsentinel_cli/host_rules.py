@@ -26,10 +26,23 @@ class HostFinding:
 
 _HOME = str(Path.home())
 
-# Tool names in Claude Code allowedTools that bypass the confirmation prompt
+# Tool names that, if allowed unscoped, bypass the confirmation prompt entirely
 _SHELL_TOOL_NAMES = frozenset({
     "bash", "computer", "shell", "terminal",
 })
+
+
+def _is_unscoped_shell_allow(entry: str) -> bool:
+    """True for bare 'Bash' or wildcard 'Bash(*)' — auto-approves every command.
+    Scoped patterns like 'Bash(git status)' or 'Bash(npm run *)' only auto-approve
+    that specific command and are not a blanket bypass."""
+    name = entry.split("(", 1)[0].strip().lower()
+    if name not in _SHELL_TOOL_NAMES:
+        return False
+    if "(" not in entry:
+        return True  # bare "Bash" — no scoping at all
+    scope = entry.split("(", 1)[1].rstrip(")").strip()
+    return scope in {"*", ""}
 
 # Broad filesystem paths — entire home dir or root gives unrestricted file access
 _BROAD_PATHS = frozenset({
@@ -73,10 +86,10 @@ def _all_mcp_servers(ctx: HostContext) -> list[McpServerConfig]:
 # ── Rules ─────────────────────────────────────────────────────────────────────
 
 def _rule_shell_unrestricted(ctx: HostContext) -> HostFinding | None:
-    """CRITICAL: Claude Code allowedTools includes shell/bash — skips confirmation prompt."""
+    """CRITICAL: an unscoped Bash allow rule skips the confirmation prompt for every command."""
     if not ctx.claude_code:
         return None
-    shell_tools = [t for t in ctx.claude_code.allowed_tools if t.lower() in _SHELL_TOOL_NAMES]
+    shell_tools = [t for t in ctx.claude_code.allowed_tools if _is_unscoped_shell_allow(t)]
     if not shell_tools:
         return None
     return HostFinding(
@@ -84,14 +97,15 @@ def _rule_shell_unrestricted(ctx: HostContext) -> HostFinding | None:
         rule_id="HOST_SHELL_UNRESTRICTED",
         category="config",
         message=(
-            "Claude Code has shell execution in allowedTools — "
-            "Bash runs without the confirmation prompt. "
+            "Claude Code has an unscoped shell allow rule (bare 'Bash' or 'Bash(*)') — "
+            "every command runs without the confirmation prompt. "
             "Prompt injection or a compromised MCP server can execute arbitrary OS commands silently."
         ),
-        detail=f"Auto-approved tools: {', '.join(shell_tools)}",
+        detail=f"Auto-approved: {', '.join(shell_tools)}",
         remediation=(
-            "Remove shell tools from allowedTools in ~/.claude/settings.json. "
-            "Claude can still run shell commands but will always ask for confirmation first."
+            "Replace unscoped Bash allow rules with specific patterns, e.g. "
+            "'Bash(git status)' or 'Bash(npm run *)', in permissions.allow. "
+            "Scoped patterns only auto-approve that exact command."
         ),
     )
 

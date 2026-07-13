@@ -104,16 +104,22 @@ def print_host_result(
 
     if ctx.claude_code:
         n_allowed = len(ctx.claude_code.allowed_tools)
+        n_denied = len(ctx.claude_code.disallowed_tools)
+        n_ask = len(ctx.claude_code.ask_tools)
         n_hooks = len(ctx.claude_code.hooks)
         n_mcp = len(ctx.claude_code.mcp_servers)
+        sources_str = ", ".join(str(p) for p in ctx.claude_code.sources)
         console.print(
-            f"  [bold white]Claude Code[/bold white]  [dim]{ctx.claude_code.path}[/dim]\n"
-            f"  [dim]  {n_allowed} allowed tool(s)  ·  "
-            f"{n_mcp} MCP server(s)  ·  {n_hooks} hook(s)[/dim]"
+            f"  [bold white]Claude Code[/bold white]  [dim]{sources_str}[/dim]\n"
+            f"  [dim]  {n_allowed} allow rule(s)  ·  {n_denied} deny rule(s)  ·  "
+            f"{n_ask} ask rule(s)  ·  {n_mcp} MCP server(s)  ·  {n_hooks} hook(s)[/dim]"
         )
         if ctx.claude_code.allowed_tools:
             tools_str = ", ".join(ctx.claude_code.allowed_tools[:8])
-            console.print(f"  [dim]  allowedTools: {tools_str}[/dim]")
+            console.print(f"  [dim]  permissions.allow: {tools_str}[/dim]")
+        if ctx.claude_code.disallowed_tools:
+            deny_str = ", ".join(ctx.claude_code.disallowed_tools[:8])
+            console.print(f"  [dim]  permissions.deny: {deny_str}[/dim]")
     else:
         console.print("  [dim]Claude Code settings not found (~/.claude/settings.json)[/dim]")
 
@@ -292,6 +298,8 @@ def as_host_json(
             "found": ctx.claude_code is not None,
             "allowed_tools": ctx.claude_code.allowed_tools if ctx.claude_code else [],
             "disallowed_tools": ctx.claude_code.disallowed_tools if ctx.claude_code else [],
+            "ask_tools": ctx.claude_code.ask_tools if ctx.claude_code else [],
+            "sources": [str(p) for p in ctx.claude_code.sources] if ctx.claude_code else [],
             "hook_count": len(ctx.claude_code.hooks) if ctx.claude_code else 0,
         },
         "claude_desktop": {

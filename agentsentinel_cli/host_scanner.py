@@ -25,11 +25,13 @@ class McpServerConfig:
 
 @dataclasses.dataclass
 class ClaudeCodeSettings:
-    path: Path
-    allowed_tools: list[str]
-    disallowed_tools: list[str]
+    path: Path                   # primary (global) settings path, kept for back-compat display
+    allowed_tools: list[str]     # merged permissions.allow + legacy allowedTools
+    disallowed_tools: list[str]  # merged permissions.deny + legacy disallowedTools
+    ask_tools: list[str]         # permissions.ask — prompts user every time, no config for/against
     hooks: list[dict]            # [{event, type, command}]
     mcp_servers: list[McpServerConfig]
+    sources: list[Path]          # every settings file that contributed (global + project + local)
 
 
 @dataclasses.dataclass
@@ -129,15 +131,7 @@ def _analyze_mcp_server(name: str, config: dict) -> McpServerConfig:
 
 # ── Claude Code settings ──────────────────────────────────────────────────────
 
-def _read_claude_code_settings() -> ClaudeCodeSettings | None:
-    path = Path.home() / ".claude" / "settings.json"
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
-
+def _extract_hooks(raw: dict) -> list[dict]:
     hooks_raw = raw.get("hooks", {})
     hook_list: list[dict] = []
     if isinstance(hooks_raw, dict):
@@ -153,21 +147,104 @@ def _read_claude_code_settings() -> ClaudeCodeSettings | None:
                         "type": h.get("type", ""),
                         "command": h.get("command", ""),
                     })
+    return hook_list
 
-    mcp_servers = [
-        _analyze_mcp_server(k, v)
-        for k, v in raw.get("mcpServers", {}).items()
+
+def _extract_permission_lists(raw: dict) -> tuple[list[str], list[str], list[str]]:
+    """Return (allow, deny, ask) tool patterns.
+
+    Modern Claude Code settings use permissions.{allow,deny,ask} (fine-grained
+    patterns like "Bash(rm -rf *)", "Read(~/.ssh/**)"). Older configs used flat
+    allowedTools/disallowedTools lists. Both are read and merged so nothing is
+    missed regardless of which schema a given settings file uses.
+    """
+    perms = raw.get("permissions", {})
+    allow = perms.get("allow", []) if isinstance(perms, dict) else []
+    deny = perms.get("deny", []) if isinstance(perms, dict) else []
+    ask = perms.get("ask", []) if isinstance(perms, dict) else []
+
+    legacy_allowed = raw.get("allowedTools", [])
+    legacy_disallowed = raw.get("disallowedTools", [])
+
+    def _merge(a: object, b: object) -> list[str]:
+        items = (a if isinstance(a, list) else []) + (b if isinstance(b, list) else [])
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in items:
+            if isinstance(item, str) and item not in seen:
+                seen.add(item)
+                out.append(item)
+        return out
+
+    return (
+        _merge(allow, legacy_allowed),
+        _merge(deny, legacy_disallowed),
+        ask if isinstance(ask, list) else [],
+    )
+
+
+def _load_settings_file(path: Path) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _read_claude_code_settings() -> ClaudeCodeSettings | None:
+    """Merge global (~/.claude/settings.json) and project-level
+    (<cwd>/.claude/settings.json, <cwd>/.claude/settings.local.json) settings.
+    Project-level files layer permissions and hooks on top of the global config,
+    matching how Claude Code itself applies them."""
+    global_path = Path.home() / ".claude" / "settings.json"
+    candidate_paths = [
+        global_path,
+        Path.cwd() / ".claude" / "settings.json",
+        Path.cwd() / ".claude" / "settings.local.json",
     ]
 
-    allowed = raw.get("allowedTools", [])
-    disallowed = raw.get("disallowedTools", [])
+    sources: list[Path] = []
+    allowed: list[str] = []
+    disallowed: list[str] = []
+    ask: list[str] = []
+    hooks: list[dict] = []
+    mcp_servers: list[McpServerConfig] = []
+
+    for path in candidate_paths:
+        raw = _load_settings_file(path)
+        if raw is None:
+            continue
+        sources.append(path)
+
+        a, d, k = _extract_permission_lists(raw)
+        for item in a:
+            if item not in allowed:
+                allowed.append(item)
+        for item in d:
+            if item not in disallowed:
+                disallowed.append(item)
+        for item in k:
+            if item not in ask:
+                ask.append(item)
+
+        hooks.extend(_extract_hooks(raw))
+        mcp_servers.extend(
+            _analyze_mcp_server(name, cfg)
+            for name, cfg in raw.get("mcpServers", {}).items()
+        )
+
+    if not sources:
+        return None
 
     return ClaudeCodeSettings(
-        path=path,
-        allowed_tools=allowed if isinstance(allowed, list) else [],
-        disallowed_tools=disallowed if isinstance(disallowed, list) else [],
-        hooks=hook_list,
+        path=global_path if global_path in sources else sources[0],
+        allowed_tools=allowed,
+        disallowed_tools=disallowed,
+        ask_tools=ask,
+        hooks=hooks,
         mcp_servers=mcp_servers,
+        sources=sources,
     )
 
 

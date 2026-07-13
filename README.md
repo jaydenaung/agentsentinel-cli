@@ -20,6 +20,7 @@ pipx install "agentsentinel-cli[all]"
 |---------|-------------|
 | `sentinel redteam mcp` | Actively exploit an MCP server — confirmed traversal, auth bypass, OAuth attacks, injection |
 | `sentinel host-scan` | Audit your machine's full AI security posture across Claude, Cursor, Windsurf, VS Code, and more |
+| `sentinel session-audit` | Audit what actually happened in past Claude Code sessions — commands run, denials, permission-mode bypasses |
 | `sentinel a2a` | Build a call graph of your multi-agent system and audit trust boundaries |
 | `sentinel discover` | Find every MCP server on a host or subnet — confirmed via protocol handshake |
 | `sentinel mcp scan` | Deep security audit of a running MCP server |
@@ -41,6 +42,10 @@ sentinel redteam mcp preauth http://localhost:8000   # zero credentials — foll
 # Local AI security posture — audits Claude, Cursor, Windsurf, VS Code, and more
 sentinel host-scan
 sentinel host-scan --fail-on HIGH
+
+# What actually ran in past Claude Code sessions — not just what's configured
+sentinel session-audit
+sentinel session-audit --project ~/code/my-app
 
 # Multi-agent trust analysis
 sentinel a2a ./agents/
@@ -213,7 +218,7 @@ sentinel host-scan --baseline
 **What it checks:**
 
 *Anthropic tools*
-- **Claude Code** — `allowedTools` (shell bypass), MCP server configs, shell hooks
+- **Claude Code** — `permissions.allow`/`deny`/`ask` (modern schema, with legacy `allowedTools`/`disallowedTools` read as a fallback), merged across global (`~/.claude/settings.json`) and project-level (`.claude/settings.json`, `.claude/settings.local.json`) config, MCP server configs, shell hooks
 - **Claude Desktop** — MCP server configs
 
 *Third-party AI tools* — MCP server configs audited with the same exfiltration, broad-filesystem, sensitive-path, and sprawl rules as Claude tools
@@ -233,13 +238,13 @@ sentinel host-scan --baseline
 
 **`--baseline`** — recommended configuration and gap analysis
 
-Adds a "Recommended Configuration Gaps" report comparing your current Claude Code / Claude Desktop settings against a single opinionated secure baseline: no shell tools in `allowedTools`, explicit `disallowedTools` denies for destructive patterns (`rm -rf`, `git push --force`, `sudo`), MCP servers scoped to project directories (not home/root), no filesystem+network combos on the same MCP server, and hooks flagged for manual review. Each gap includes the concrete risk and a fix, plus a pasteable `~/.claude/settings.json` snippet with the suggested `allowedTools`/`disallowedTools`. JSON output adds `posture_gaps` and `recommended_settings_snippet` keys.
+Adds a "Recommended Configuration Gaps" report comparing your current Claude Code / Claude Desktop settings against a single opinionated secure baseline: no unscoped `Bash`/`Bash(*)` allow rule, explicit `permissions.deny` entries for destructive patterns (`rm -rf`, `git push --force`, `sudo`), MCP servers scoped to project directories (not home/root), no filesystem+network combos on the same MCP server, and hooks flagged for manual review. Each gap includes the concrete risk and a fix, plus a pasteable `~/.claude/settings.json` snippet with the suggested `permissions.allow`/`deny`. JSON output adds `posture_gaps` and `recommended_settings_snippet` keys.
 
 **Rules:**
 
 | Rule | Severity | Category | What it catches |
 |------|----------|----------|-----------------|
-| `HOST_SHELL_UNRESTRICTED` | CRITICAL | config | `Bash` in `allowedTools` — shell runs without confirmation prompt |
+| `HOST_SHELL_UNRESTRICTED` | CRITICAL | config | Unscoped `Bash`/`Bash(*)` allow rule — shell runs without confirmation prompt for every command |
 | `HOST_SIP_DISABLED` | CRITICAL | system | macOS System Integrity Protection is off |
 | `HOST_API_KEY_IN_SHELL` | HIGH | data_exposure | AI API keys hardcoded in shell config files |
 | `HOST_MCP_EXFIL_PATH` | HIGH | config | Any AI tool's MCP server has both filesystem access and network capability |
@@ -258,6 +263,44 @@ Adds a "Recommended Configuration Gaps" report comparing your current Claude Cod
 | `HOST_LARGE_MEMORY` | LOW | data_exposure | Claude Code memory files exceed 50 MB of accumulated conversation data |
 
 Every finding includes a remediation step. The posture score (0–100) uses CRITICAL −40, HIGH −20, MEDIUM −10, LOW −5.
+
+---
+
+### `sentinel session-audit` — Claude Code session audit
+
+Complements `host-scan --baseline`: instead of checking static config, it parses actual session transcripts (`~/.claude/projects/**/*.jsonl`) to report what really happened — which tools ran, which permission mode was active, what got denied, and whether any destructive command was actually executed rather than merely permitted.
+
+No network calls. Local and read-only.
+
+```bash
+sentinel session-audit
+sentinel session-audit --project ~/code/my-app
+sentinel session-audit --since 7
+sentinel session-audit --all-history --format json
+sentinel session-audit --fail-on HIGH
+```
+
+By default, scans the 20 most recent sessions across every project. `--project <path>` restricts to one project (matched against the session's recorded working directory, not the on-disk folder name). `--since <days>` scans a time window instead of a session count. `--all-history` scans every transcript on disk.
+
+**What it checks:**
+- **Tool usage per session** — every `Bash`/`Read`/`Write`/`Edit`/etc. call actually made, tallied
+- **Permission-mode switches** — including `bypassPermissions`, where every tool call ran with zero confirmation
+- **Permission denials** — attempts that were blocked, parsed from the transcript's own denial messages
+- **Destructive commands actually executed** — `rm -rf`, `git push --force`, `sudo`, etc., that ran (not just hypothetically allowed by config)
+- **Sensitive-path access** — Read/Write/Edit touching `~/.ssh`, `~/.aws`, Keychain, etc.
+- **Out-of-project writes** — Write/Edit landing outside the session's own project directory
+
+**Rules:**
+
+| Rule | Severity | Category | What it catches |
+|------|----------|----------|-----------------|
+| `SESSION_BYPASS_MODE` | HIGH | permissions | A session ran with `bypassPermissions` — no confirmation prompts at all |
+| `SESSION_RISKY_COMMAND_EXECUTED` | HIGH | config | A destructive command (`rm -rf`, `git push --force`, `sudo`) actually ran |
+| `SESSION_SENSITIVE_PATH_TOUCHED` | HIGH | data_exposure | Read/Write/Edit accessed a credential or sensitive directory |
+| `SESSION_OUT_OF_PROJECT_WRITE` | MEDIUM | config | Write/Edit landed outside the session's own project directory |
+| `SESSION_HIGH_DENIAL_RATE` | LOW | permissions | A session hit 5+ permission denials — friction or repeated denied attempts |
+
+Same scoring convention as `host-scan`: CRITICAL −40, HIGH −20, MEDIUM −10, LOW −5.
 
 ---
 
@@ -497,7 +540,7 @@ Supported on: `sentinel scan`, `sentinel a2a`, `sentinel mcp scan`, `sentinel su
 |------------|-----|------------------|
 | Agent Goal Hijack | ASI01 | `sentinel scan` (PROMPT_INJECTION_VECTOR), `sentinel supply-chain` (SC01), **`sentinel redteam mcp poison`** (confirmed injection) |
 | Tool Misuse & Exploitation | ASI02 | `sentinel mcp scan`, `sentinel scan`, **`sentinel redteam mcp inject`** (confirmed exploitation) |
-| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED), **`sentinel redteam mcp auth`** (credential bypass + OAuth scope escalation + X-Agent-Scopes forgery) |
+| Agent Identity & Privilege Abuse | ASI03 | `sentinel scan` (PRIVILEGE_EXCESS), `sentinel host-scan` (HOST_SHELL_UNRESTRICTED), `sentinel session-audit` (SESSION_BYPASS_MODE, SESSION_RISKY_COMMAND_EXECUTED), **`sentinel redteam mcp auth`** (credential bypass + OAuth scope escalation + X-Agent-Scopes forgery) |
 | Agentic Supply Chain Compromise | ASI04 | **`sentinel supply-chain`** (static + AI semantic analysis), **`sentinel redteam mcp poison`** (static description scan) |
 | Unexpected Code Execution | ASI05 | `sentinel scan` (CODE_EXECUTION_GRANT), `sentinel mcp scan` (CODE_EXECUTION_TOOL), **`sentinel redteam mcp inject --type cmd`** |
 | Memory & Context Poisoning | ASI06 | **`sentinel secrets`** (memory contamination, system prompt leakage), `sentinel host-scan` (HOST_LARGE_MEMORY), **`sentinel redteam mcp preauth`** (CORS misconfiguration) |
@@ -560,7 +603,7 @@ NO_AUTH    # server is behind an authenticated reverse proxy
 ## Requirements
 
 - Python 3.10+
-- No API key required for: `sentinel redteam mcp`, `sentinel host-scan`, `sentinel a2a`, `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`
+- No API key required for: `sentinel redteam mcp`, `sentinel host-scan`, `sentinel session-audit`, `sentinel a2a`, `sentinel discover`, `sentinel mcp scan`, `sentinel supply-chain`, `sentinel scan`, `sentinel secrets`, `sentinel inspect --no-ai`
 - `ANTHROPIC_API_KEY` required for: `sentinel supply-chain --ai`, `sentinel inspect` (AI summary)
 
 ---

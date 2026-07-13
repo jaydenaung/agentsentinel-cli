@@ -920,6 +920,93 @@ def host(
             sys.exit(1)
 
 
+# ── sentinel session-audit ──────────────────────────────────────────────────────
+
+@main.command(name="session-audit")
+@click.option("--project", type=click.Path(exists=True, file_okay=False), default=None,
+              help="Restrict to sessions run in this project directory. Default: all projects.")
+@click.option("--limit", type=int, default=20, show_default=True,
+              help="Max number of most-recent sessions to scan. Ignored with --since/--all-history.")
+@click.option("--since", "since_days", type=int, default=None, metavar="DAYS",
+              help="Scan sessions from the last N days instead of using --limit.")
+@click.option("--all-history", is_flag=True, default=False,
+              help="Scan every session transcript on disk, ignoring --limit.")
+@click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text",
+              help="Output format.")
+@click.option("--fail-on", type=click.Choice(["CRITICAL", "HIGH", "MEDIUM", "LOW"]),
+              default=None, help="Exit with code 1 if findings at or above this severity exist.")
+@click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
+              help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
+def session_audit(
+    project: str | None,
+    limit: int,
+    since_days: int | None,
+    all_history: bool,
+    fmt: str,
+    fail_on: str | None,
+    ignore_rules: tuple[str, ...],
+) -> None:
+    """Audit what actually happened in past Claude Code sessions.
+
+    Parses session transcripts in ~/.claude/projects/ to report tool usage,
+    permission-mode switches (including bypassPermissions), permission denials,
+    destructive commands that were actually executed, and files touched outside
+    the project directory or in sensitive locations.
+
+    Complements 'sentinel host-scan --baseline', which checks static config —
+    this checks what was actually done. No network calls; local and read-only.
+
+    \b
+    Examples:
+        sentinel session-audit
+        sentinel session-audit --project ~/code/my-app
+        sentinel session-audit --since 7
+        sentinel session-audit --all-history --format json
+        sentinel session-audit --fail-on HIGH
+    """
+    from agentsentinel_cli.session_scanner import scan_sessions
+    from agentsentinel_cli.session_rules import run_session_rules, session_posture_score
+    from agentsentinel_cli.session_report import print_session_result, as_session_json
+    from agentsentinel_cli import suppress as _suppress
+    from rich.progress import Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+
+    project_path = Path(project).resolve() if project else None
+    _sessions_holder: list = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[dim]{task.description}[/dim]"),
+        TimeElapsedColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        progress.add_task("Scanning Claude Code session transcripts…", total=None)
+        _sessions_holder.append(scan_sessions(
+            project=project_path, limit=limit, since_days=since_days, all_history=all_history,
+        ))
+
+    sessions = _sessions_holder[0]
+    findings = run_session_rules(sessions)
+
+    sup_rules = _suppress.merge(_suppress.load_ignore_file(Path.cwd()), ignore_rules)
+    findings, suppressed = _suppress.apply(findings, sup_rules)
+    score = session_posture_score(findings)
+
+    if fmt == "json":
+        click.echo(as_session_json(sessions, findings, score))
+    else:
+        print_session_result(sessions, findings, score)
+        msg = _suppress.notice(suppressed)
+        if msg:
+            console.print(f"  {msg}\n")
+
+    if fail_on:
+        _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
+        threshold = _rank.get(fail_on, 0)
+        if any(_rank.get(f.severity, 0) >= threshold for f in findings):
+            sys.exit(1)
+
+
 def _parse_ports(ports_str: str) -> list[int]:
     """Parse '8000-9001' or '8000,8080,9000' into a list of ints."""
     ports: list[int] = []
