@@ -79,6 +79,45 @@ def print_session_result(sessions: list[SessionInfo], findings: list[SessionFind
             tbl.add_row(s.session_id[:8], project_str, modes_str, tools_str, denial_str)
         console.print(tbl)
 
+    # Denial detail — the table only shows a count; show what was actually blocked
+    denied_sessions = [s for s in sessions if s.denials]
+    if denied_sessions:
+        console.print()
+        console.print("  [bold white]Permission Denials[/bold white]")
+        for s in denied_sessions:
+            console.print(f"  [dim]  {s.session_id[:8]}:[/dim]")
+            for d in s.denials[:5]:
+                target = f" [dim]{d.target}[/dim]" if d.target else ""
+                console.print(f"  [dim]    ✗ {d.tool}[/dim]{target}")
+            if len(s.denials) > 5:
+                console.print(f"  [dim]    … and {len(s.denials) - 5} more[/dim]")
+
+    # Parse errors — a security tool should say so when a transcript couldn't be
+    # fully read, rather than silently under-reporting findings for that session.
+    error_sessions = [s for s in sessions if s.parse_errors > 0]
+    if error_sessions:
+        console.print()
+        total_errors = sum(s.parse_errors for s in error_sessions)
+        console.print(
+            f"  [dim yellow]ℹ  {len(error_sessions)} session(s) had {total_errors} unparseable "
+            f"line(s) — findings for those sessions may be incomplete: "
+            f"{', '.join(s.session_id[:8] for s in error_sessions[:5])}[/dim yellow]"
+        )
+
+    # Schema warnings — lines/blocks that parsed as valid JSON but didn't match
+    # any known transcript shape. Unlike parse_errors, this catches Claude Code
+    # format changes that json.loads wouldn't flag on its own.
+    warned_sessions = [s for s in sessions if s.schema_warnings > 0]
+    if warned_sessions:
+        console.print()
+        total_warnings = sum(s.schema_warnings for s in warned_sessions)
+        console.print(
+            f"  [dim yellow]ℹ  {len(warned_sessions)} session(s) had {total_warnings} "
+            f"unrecognized transcript entries — the parser may be out of date with "
+            f"Claude Code's format; findings could be incomplete: "
+            f"{', '.join(s.session_id[:8] for s in warned_sessions[:5])}[/dim yellow]"
+        )
+
     # ── Findings ──────────────────────────────────────────────────────────────
     console.print()
     if findings:
@@ -146,6 +185,8 @@ def as_session_json(sessions: list[SessionInfo], findings: list[SessionFinding],
                     {"tool": d.tool, "target": d.target, "timestamp": d.timestamp}
                     for d in s.denials
                 ],
+                "parse_errors": s.parse_errors,
+                "schema_warnings": s.schema_warnings,
             }
             for s in sessions
         ],

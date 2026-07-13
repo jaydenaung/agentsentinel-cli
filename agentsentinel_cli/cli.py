@@ -937,6 +937,8 @@ def host(
               default=None, help="Exit with code 1 if findings at or above this severity exist.")
 @click.option("--ignore-rule", "ignore_rules", multiple=True, metavar="RULE_ID",
               help="Suppress a finding by rule ID. Repeatable. Also reads .sentinelignore.")
+@click.option("--no-cache", is_flag=True, default=False,
+              help="Ignore the on-disk parse cache (~/.agentsentinel/session_cache.json) and reparse everything.")
 def session_audit(
     project: str | None,
     limit: int,
@@ -945,6 +947,7 @@ def session_audit(
     fmt: str,
     fail_on: str | None,
     ignore_rules: tuple[str, ...],
+    no_cache: bool,
 ) -> None:
     """Audit what actually happened in past Claude Code sessions.
 
@@ -954,7 +957,9 @@ def session_audit(
     the project directory or in sensitive locations.
 
     Complements 'sentinel host-scan --baseline', which checks static config —
-    this checks what was actually done. No network calls; local and read-only.
+    this checks what was actually done. No network calls; parsed transcripts
+    are cached on disk (~/.agentsentinel/session_cache.json) so repeat runs
+    only reparse new or changed sessions — pass --no-cache to disable.
 
     \b
     Examples:
@@ -964,7 +969,7 @@ def session_audit(
         sentinel session-audit --all-history --format json
         sentinel session-audit --fail-on HIGH
     """
-    from agentsentinel_cli.session_scanner import scan_sessions
+    from agentsentinel_cli.session_scanner import scan_sessions, has_any_sessions
     from agentsentinel_cli.session_rules import run_session_rules, session_posture_score
     from agentsentinel_cli.session_report import print_session_result, as_session_json
     from agentsentinel_cli import suppress as _suppress
@@ -982,7 +987,8 @@ def session_audit(
     ) as progress:
         progress.add_task("Scanning Claude Code session transcripts…", total=None)
         _sessions_holder.append(scan_sessions(
-            project=project_path, limit=limit, since_days=since_days, all_history=all_history,
+            project=project_path, limit=limit, since_days=since_days,
+            all_history=all_history, use_cache=not no_cache,
         ))
 
     sessions = _sessions_holder[0]
@@ -999,6 +1005,20 @@ def session_audit(
         msg = _suppress.notice(suppressed)
         if msg:
             console.print(f"  {msg}\n")
+
+        if not sessions:
+            if not has_any_sessions():
+                console.print(
+                    "  [dim]No Claude Code session history found "
+                    "(~/.claude/projects/ is empty or missing).[/dim]\n"
+                )
+            elif project_path:
+                console.print(
+                    f"  [yellow]No sessions matched --project {project_path}.[/yellow]\n"
+                    "  [dim]This matches Claude Code's recorded working directory for each "
+                    "session, not the on-disk folder name. Run without --project to see what "
+                    "was recorded, or check for a symlinked path.[/dim]\n"
+                )
 
     if fail_on:
         _rank = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
